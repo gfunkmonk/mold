@@ -79,7 +79,9 @@ int redo_main(std::string_view target, int argc, char **argv) {
   if constexpr (HAVE_TARGET_LOONGARCH64)
     if (target == LOONGARCH64::name)
       return mold_main<LOONGARCH64>(argc, argv);
-  abort();
+  std::cerr << "mold: unsupported target: " << target
+            << "; rebuild mold with the appropriate target support\n";
+  exit(1);
 }
 
 template <typename E>
@@ -360,26 +362,23 @@ void resolve_symbols(Context<E> &ctx) {
   // we could eliminate a symbol that is already resolved to and cause
   // dangling references.
   tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-    if (file->is_reachable) {
+    if (file->is_reachable)
       for (ComdatGroupRef<E> &ref : file->comdat_groups)
         update_minimum(ref.group->owner, file->priority);
-    }
   });
 
+  // LTO plugin symbol tables may not enumerate all section-level helper
+  // symbols (e.g. some thunks). If an LTO file wins COMDAT ownership for
+  // a key shared with regular object files, section elimination may discard
+  // needed regular COMDAT members and create dangling relocations.
+  //
+  // Therefore, only let IR files claim ownership for COMDAT keys that have
+  // no reachable regular-object owner.
   tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-    if (!file->is_reachable)
-      return;
-
-    // LTO plugin symbol tables may not enumerate all section-level helper
-    // symbols (e.g. some thunks). If an LTO file wins COMDAT ownership for
-    // a key shared with regular object files, section elimination may discard
-    // needed regular COMDAT members and create dangling relocations.
-    //
-    // Therefore, only let IR files claim ownership for COMDAT keys that have
-    // no reachable regular-object owner.
-    for (ComdatGroup *g : file->lto_comdat_groups)
-      if (g && g->owner == (u32)-1)
-        update_minimum(g->owner, file->priority);
+    if (file->is_reachable)
+      for (ComdatGroup *g : file->lto_comdat_groups)
+        if (g && g->owner == (u32)-1)
+          update_minimum(g->owner, file->priority);
   });
 
   tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
@@ -1163,6 +1162,15 @@ void convert_zero_to_bss(Context<E> &ctx) {
   });
 }
 
+template <typename E>
+static bool has_dso_definition(Context<E> &ctx, Symbol<E> &sym) {
+  for (std::unique_ptr<SharedFile<E>> &file : ctx.dso_pool)
+    for (i64 i = 0; i < file->symbols.size(); i++)
+      if (file->symbols[i] == &sym && !file->elf_syms[i].is_undef())
+        return true;
+  return false;
+}
+
 // If --no-allow-shlib-undefined is specified, we report errors on
 // unresolved symbols in shared libraries. This is useful when you are
 // creating a final executable and want to make sure that all symbols
@@ -1204,8 +1212,10 @@ void check_shlib_undefined(Context<E> &ctx) {
       for (i64 i = 0; i < file->elf_syms.size(); i++) {
         const ElfSym<E> &esym = file->elf_syms[i];
         Symbol<E> &sym = *file->symbols[i];
-        if (esym.is_undef() && !esym.is_weak() && !sym.file &&
-            !is_sparc_register(esym))
+
+        if (esym.is_undef() && !esym.is_weak() && !is_sparc_register(esym) &&
+            (!sym.file || sym.visibility == STV_HIDDEN) &&
+            !has_dso_definition(ctx, sym))
           Error(ctx) << *file << ": --no-allow-shlib-undefined: undefined symbol: "
                      << sym;
       }
@@ -3410,18 +3420,6 @@ void write_separate_debug_file(Context<E> &ctx) {
   i64 num_chunks = ctx.chunks.size();
   append(ctx.chunks, ctx.debug_chunks);
 
-  tbb::parallel_for(num_chunks, (i64)ctx.chunks.size(), [&](i64 i) {
-    ctx.chunks[i]->compute_section_size(ctx);
-  });
-
-  sort_debug_info_sections(ctx);
-
-  // Handle --compress-debug-info
-  if (ctx.arg.compress_debug_sections != ELFCOMPRESS_NONE)
-    compress_debug_sections(ctx);
-
-  // Recompute section header contents since we have added debug sections
-  compute_section_headers(ctx);
 
   // A debug info file contains all sections as the original file, though
   // most of them can be empty as if they were bss sections. We convert
@@ -3439,6 +3437,19 @@ void write_separate_debug_file(Context<E> &ctx) {
       ctx.chunk_pool.emplace_back(sec);
     }
   }
+
+  tbb::parallel_for(num_chunks, (i64)ctx.chunks.size(), [&](i64 i) {
+    ctx.chunks[i]->compute_section_size(ctx);
+  });
+
+  sort_debug_info_sections(ctx);
+
+  // Handle --compress-debug-info
+  if (ctx.arg.compress_debug_sections != ELFCOMPRESS_NONE)
+    compress_debug_sections(ctx);
+
+  // Recompute section header contents since we have added debug sections
+  compute_section_headers(ctx);
 
   // Assign file offsets to sections
   i64 fileoff = 0;

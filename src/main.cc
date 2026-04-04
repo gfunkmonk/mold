@@ -50,6 +50,7 @@ static ObjectFile<E> *new_lto_obj(Context<E> &ctx, ReaderContext &rctx,
   ObjectFile<E> *file = read_lto_object(ctx, mf);
   if (!file)
     return nullptr;
+
   file->priority = ctx.file_priority++;
   file->archive_name = archive_name;
   file->as_needed =
