@@ -89,7 +89,7 @@ Options:
   --color-diagnostics=[auto,always,never]
                               Use colors in diagnostics
   --color-diagnostics         Alias for --color-diagnostics=always
-  --compress-debug-sections [none,zlib,zlib-gabi,zstd]
+  --compress-debug-sections=[none,zlib,zlib:0,...,zlib:9,zstd,zstd:1,...,zstd:22]
                               Compress .debug_* sections
   --dc                        Ignored
   --dependency-file=FILE      Write Makefile-style dependency rules to FILE
@@ -1039,14 +1039,31 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("zero-to-bss")) {
       ctx.arg.zero_to_bss = true;
     } else if (read_arg("compress-debug-sections")) {
-      if (arg == "zlib" || arg == "zlib-gabi")
+      if (arg == "zlib" || arg == "zlib-gabi") {
         ctx.arg.compress_debug_sections = ELFCOMPRESS_ZLIB;
-      else if (arg == "zstd")
+        ctx.arg.compress_debug_sections_level = 1;
+      } else if (arg.starts_with("zlib:")) {
+        ctx.arg.compress_debug_sections = ELFCOMPRESS_ZLIB;
+        i64 level = parse_number(ctx, "compress-debug-sections", arg.substr(5));
+        if (level < 0 || 9 < level)
+          Fatal(ctx) << "invalid --compress-debug-sections argument: " << arg
+                     << " (zlib level must be between 0 and 9)";
+        ctx.arg.compress_debug_sections_level = level;
+      } else if (arg == "zstd") {
         ctx.arg.compress_debug_sections = ELFCOMPRESS_ZSTD;
-      else if (arg == "none")
+        ctx.arg.compress_debug_sections_level = 3;
+      } else if (arg.starts_with("zstd:")) {
+        ctx.arg.compress_debug_sections = ELFCOMPRESS_ZSTD;
+        i64 level = parse_number(ctx, "compress-debug-sections", arg.substr(5));
+        if (level < 1 || 22 < level)
+          Fatal(ctx) << "invalid --compress-debug-sections argument: " << arg
+                     << " (zstd level must be between 1 and 22)";
+        ctx.arg.compress_debug_sections_level = level;
+      } else if (arg == "none") {
         ctx.arg.compress_debug_sections = ELFCOMPRESS_NONE;
-      else
+      } else {
         Fatal(ctx) << "invalid --compress-debug-sections argument: " << arg;
+      }
     } else if (read_arg("wrap")) {
       ctx.arg.wrap.insert(arg);
     } else if (read_flag("omagic") || read_flag("N")) {

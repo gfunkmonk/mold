@@ -45,12 +45,11 @@ static std::vector<std::span<u8>> split(std::span<u8> input) {
   return vec;
 }
 
-static std::span<u8> zlib_compress(std::span<u8> input) {
+static std::span<u8> zlib_compress(std::span<u8> input, int level) {
   // Initialize zlib stream. Since debug info is generally compressed
-  // pretty well with lower compression levels, we chose compression
-  // level 1.
+  // pretty well with lower compression levels, the default level is 1.
   z_stream strm = {};
-  CHECK(deflateInit2(&strm, 1, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY));
+  CHECK(deflateInit2(&strm, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY));
 
   // Set an input buffer
   strm.avail_in = input.size();
@@ -94,7 +93,7 @@ static std::span<u8> zlib_compress(std::span<u8> input) {
   return {buf, (size_t)(bufsize - strm.avail_out)};
 }
 
-ZlibCompressor::ZlibCompressor(u8 *buf, i64 size) {
+ZlibCompressor::ZlibCompressor(u8 *buf, i64 size, i64 level) {
   std::vector<std::span<u8>> inputs = split(std::span(buf, size));
   std::vector<u32> adlers(inputs.size());
   shards.resize(inputs.size());
@@ -103,7 +102,7 @@ ZlibCompressor::ZlibCompressor(u8 *buf, i64 size) {
   tbb::parallel_for((i64)0, (i64)inputs.size(), [&](i64 i) {
     std::span<u8> in = inputs[i];
     adlers[i] = adler32(1, in.data(), in.size());
-    shards[i] = zlib_compress(in);
+    shards[i] = zlib_compress(in, level);
   });
 
   // Combine checksums
@@ -139,22 +138,21 @@ void ZlibCompressor::write_to(u8 *buf) {
   *(ub32 *)(end - 4) = checksum;
 }
 
-static std::span<u8> zstd_compress(std::span<u8> input) {
+static std::span<u8> zstd_compress(std::span<u8> input, int level) {
   i64 bufsize = ZSTD_COMPRESSBOUND(input.size());
   u8 *buf = new u8[bufsize];
-  int level = 3; // compression level; must be between 1 to 22
   size_t sz = ZSTD_compress(buf, bufsize, input.data(), input.size(), level);
   assert(!ZSTD_isError(sz));
   return {buf, sz};
 }
 
-ZstdCompressor::ZstdCompressor(u8 *buf, i64 size) {
+ZstdCompressor::ZstdCompressor(u8 *buf, i64 size, i64 level) {
   std::vector<std::span<u8>> inputs = split(std::span(buf, size));
   shards.resize(inputs.size());
 
   // Compress each shard
   tbb::parallel_for((i64)0, (i64)inputs.size(), [&](i64 i) {
-    shards[i] = zstd_compress(inputs[i]);
+    shards[i] = zstd_compress(inputs[i], level);
   });
 
   compressed_size = 0;
