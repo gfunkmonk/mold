@@ -139,11 +139,11 @@ void create_synthetic_sections(Context<E> &ctx) {
   if constexpr (!is_sparc<E>)
     ctx.gotplt = push(new GotPltSection<E>(ctx));
 
-  ctx.reldyn = push(new RelDynSection<E>);
+  ctx.reldyn = push(new RelDynSection<E>(ctx));
   ctx.relplt = push(new RelPltSection<E>);
 
   if (ctx.arg.pack_dyn_relocs_relr)
-    ctx.relrdyn = push(new RelrDynSection<E>);
+    ctx.relrdyn = push(new RelrDynSection<E>(ctx));
 
   ctx.strtab = push(new StrtabSection<E>);
   ctx.plt = push(new PltSection<E>);
@@ -1992,15 +1992,6 @@ void copy_chunks(Context<E> &ctx) {
   zero(chunks.back(), ctx.output_file->filesize);
 }
 
-template <typename E>
-void construct_relr(Context<E> &ctx) {
-  Timer t(ctx, "construct_relr");
-
-  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    chunk->construct_relr(ctx);
-  });
-}
-
 // The hash function for .gnu.hash.
 static u32 djb_hash(std::string_view name) {
   u32 h = 5381;
@@ -2996,6 +2987,17 @@ i64 set_osec_offsets(Context<E> &ctx) {
       set_virtual_addresses_regular(ctx);
     else
       set_virtual_addresses_by_order(ctx);
+
+    if (ctx.arg.pack_dyn_relocs_relr || ctx.arg.pack_dyn_relocs_android) {
+      i64 x = ctx.reldyn->shdr.sh_size;
+      i64 y = ctx.relrdyn ? (i64)ctx.relrdyn->shdr.sh_size : 0;
+      ctx.reldyn->update_shdr(ctx);
+
+      if (x != (i64)ctx.reldyn->shdr.sh_size ||
+          y != (ctx.relrdyn ? (i64)ctx.relrdyn->shdr.sh_size : 0))
+        continue;
+    }
+
     ctx.checkpoint();
 
     // Assigning new offsets may change the contents and the length
@@ -3303,6 +3305,10 @@ std::vector<std::span<u8>> get_shards(Context<E> &ctx) {
 template <typename E>
 void sort_reldyn(Context<E> &ctx) {
   Timer t(ctx, "sort_reldyn");
+
+  // .rela.dyn contains APS2-encoded bytes, not ElfRel entries.
+  if (ctx.arg.pack_dyn_relocs_android)
+    return;
 
   ElfRel<E> *begin = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset);
   ElfRel<E> *end = begin + ctx.reldyn->shdr.sh_size / sizeof(ElfRel<E>);
@@ -3666,7 +3672,6 @@ template void scan_relocations(Context<E> &);
 template void report_undef_errors(Context<E> &);
 template void create_reloc_sections(Context<E> &);
 template void copy_chunks(Context<E> &);
-template void construct_relr(Context<E> &);
 template void sort_dynsyms(Context<E> &);
 template void sort_debug_info_sections(Context<E> &);
 template void create_output_symtab(Context<E> &);

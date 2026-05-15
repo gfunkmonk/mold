@@ -539,7 +539,6 @@ public:
   i64 offset = -1;
   i32 shndx = -1;
   i32 relsec_idx = -1;
-  i32 reldyn_offset = 0;
 
   bool uncompressed = false;
 
@@ -647,11 +646,12 @@ public:
   virtual bool is_header() { return false; }
   virtual OutputSection<E> *to_osec() { return nullptr; }
   virtual void compute_section_size(Context<E> &ctx) {}
-  virtual i64 get_reldyn_size(Context<E> &ctx) const { return 0; }
-  virtual void construct_relr(Context<E> &ctx) {}
   virtual void copy_buf(Context<E> &ctx) {}
   virtual void write_to(Context<E> &ctx, u8 *buf) { unreachable(); }
   virtual void update_shdr(Context<E> &ctx) {}
+
+  virtual std::vector<ElfRel<E>>
+  collect_dynrels(Context<E> &ctx) const { return {}; }
 
   std::string_view name;
   ElfShdr<E> shdr = { .sh_addralign = 1 };
@@ -673,14 +673,8 @@ public:
   i64 strtab_size = 0;
   i64 strtab_offset = 0;
 
-  // Offset in .rel.dyn
-  i64 reldyn_offset = 0;
-
   // For --section-order
   i64 sect_order = 0;
-
-  // For --pack-dyn-relocs=relr
-  std::vector<u64> relr;
 };
 
 // ELF header which is at the beginning of each ELF file.
@@ -756,7 +750,6 @@ public:
 enum AbsRelKind {
   ABS_REL_NONE,
   ABS_REL_BASEREL,
-  ABS_REL_RELR,
   ABS_REL_IFUNC,
   ABS_REL_DYNREL,
 };
@@ -783,8 +776,7 @@ public:
 
   OutputSection<E> *to_osec() override { return this; }
   void compute_section_size(Context<E> &ctx) override;
-  i64 get_reldyn_size(Context<E> &ctx) const override;
-  void construct_relr(Context<E> &ctx) override;
+  std::vector<ElfRel<E>> collect_dynrels(Context<E> &ctx) const override;
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
 
@@ -831,10 +823,9 @@ public:
 
   u64 get_tlsld_addr(Context<E> &ctx) const;
   bool has_tlsld(Context<E> &ctx) const { return tlsld_idx != -1; }
-  i64 get_reldyn_size(Context<E> &ctx) const override;
+  std::vector<ElfRel<E>> collect_dynrels(Context<E> &ctx) const override;
   void copy_buf(Context<E> &ctx) override;
 
-  void construct_relr(Context<E> &ctx) override;
   void compute_symtab_size(Context<E> &ctx) override;
   void populate_symtab(Context<E> &ctx) override;
 
@@ -938,15 +929,22 @@ public:
 template <typename E>
 class RelDynSection : public Chunk<E> {
 public:
-  RelDynSection() {
+  RelDynSection(Context<E> &ctx) {
     this->name = E::is_rela ? ".rela.dyn" : ".rel.dyn";
-    this->shdr.sh_type = E::is_rela ? SHT_RELA : SHT_REL;
+    if (ctx.arg.pack_dyn_relocs_android)
+      this->shdr.sh_type = E::is_rela ? SHT_ANDROID_RELA : SHT_ANDROID_REL;
+    else
+      this->shdr.sh_type = E::is_rela ? SHT_RELA : SHT_REL;
     this->shdr.sh_flags = SHF_ALLOC;
     this->shdr.sh_entsize = sizeof(ElfRel<E>);
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
 
   void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+
+  std::vector<ElfRel<E>> relocs;
+  std::vector<u8> android_encoded;
 };
 
 // .relr.dyn is a relatively new section to contain base relocation
@@ -985,16 +983,17 @@ public:
 template <typename E>
 class RelrDynSection : public Chunk<E> {
 public:
-  RelrDynSection() {
+  RelrDynSection(Context<E> &ctx) {
     this->name = ".relr.dyn";
-    this->shdr.sh_type = SHT_RELR;
+    this->shdr.sh_type = ctx.arg.use_android_relr_tags ? SHT_ANDROID_RELR : SHT_RELR;
     this->shdr.sh_flags = SHF_ALLOC;
     this->shdr.sh_entsize = sizeof(Word<E>);
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
 
-  void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
+
+  std::vector<u64> relocs;
 };
 
 // .strtab is referenced by .strtab and contains symbol names. Note that
@@ -1298,8 +1297,7 @@ public:
   }
 
   void add_symbol(Context<E> &ctx, Symbol<E> *sym);
-  i64 get_reldyn_size(Context<E> &ctx) const override { return symbols.size(); }
-  void copy_buf(Context<E> &ctx) override;
+  std::vector<ElfRel<E>> collect_dynrels(Context<E> &ctx) const override;
 
   std::vector<Symbol<E> *> symbols;
 };
@@ -1852,7 +1850,7 @@ private:
   std::string get_soname(Context<E> &ctx);
   void maybe_override_symbol(Symbol<E> &sym, const ElfSym<E> &esym);
   std::vector<std::string_view> read_dt_needed(Context<E> &ctx);
-  std::vector<std::string_view> read_verdef(Context<E> &ctx);
+  std::vector<std::string_view> read_version_strings(Context<E> &ctx);
 
   std::vector<u16> versyms;
   const ElfShdr<E> *symtab_sec;
@@ -2064,7 +2062,6 @@ template <typename E> void sort_output_sections(Context<E> &);
 template <typename E> void claim_unresolved_symbols(Context<E> &);
 template <typename E> void scan_relocations(Context<E> &);
 template <typename E> void compute_imported_symbol_weakness(Context<E> &);
-template <typename E> void construct_relr(Context<E> &);
 template <typename E> void sort_dynsyms(Context<E> &);
 template <typename E> void sort_debug_info_sections(Context<E> &);
 template <typename E> void create_output_symtab(Context<E> &);
@@ -2164,7 +2161,7 @@ public:
   }
 
   void add_symbol(Context<PPC64V1> &ctx, Symbol<PPC64V1> *sym);
-  i64 get_reldyn_size(Context<PPC64V1> &ctx) const override;
+  std::vector<ElfRel<PPC64V1>> collect_dynrels(Context<PPC64V1> &ctx) const override;
   void copy_buf(Context<PPC64V1> &ctx) override;
 
   static constexpr i64 ENTRY_SIZE = sizeof(Word<PPC64V1>) * 3;
@@ -2373,6 +2370,7 @@ struct Context {
     bool noinhibit_exec = false;
     bool oformat_binary = false;
     bool omagic = false;
+    bool pack_dyn_relocs_android = false;
     bool pack_dyn_relocs_relr = false;
     bool perf = false;
     bool pic = false;
@@ -2394,6 +2392,7 @@ struct Context {
     bool suppress_warnings = false;
     bool trace = false;
     bool undefined_version = false;
+    bool use_android_relr_tags = false;
     bool warn_common = false;
     bool warn_once = false;
     bool warn_textrel = false;
