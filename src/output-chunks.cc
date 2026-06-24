@@ -276,6 +276,10 @@ static std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   if (ctx.eh_frame_hdr)
     define(PT_GNU_EH_FRAME, PF_R, ctx.eh_frame_hdr);
 
+  // Add PT_GNU_SFRAME
+  if (ctx.sframe && ctx.sframe->shdr.sh_size)
+    define(PT_GNU_SFRAME, PF_R, ctx.sframe);
+
   // Add PT_GNU_PROPERTY
   if (Chunk<E> *chunk = find_chunk(ctx, ".note.gnu.property"))
     define(PT_GNU_PROPERTY, PF_R, chunk);
@@ -421,7 +425,15 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
   }
 
   if (ctx.arg.pack_dyn_relocs_android) {
+    // APS2 uses SLEB128-encoded deltas, so .rela.dyn size may oscillate
+    // as addresses move. If a shrink is followed by a growth, stop
+    // shrinking and pad the encoded stream to converge.
     android_encoded = encode_android<E>(relocs);
+    i64 old_size = this->shdr.sh_size;
+    if (old_size != 0 && old_size < (i64)android_encoded.size())
+      keep_android_size = true;
+    if (keep_android_size && android_encoded.size() < old_size)
+      android_encoded.resize(old_size);
     this->shdr.sh_size = android_encoded.size();
   } else {
     this->shdr.sh_size = relocs.size() * sizeof(ElfRel<E>);
@@ -1679,6 +1691,8 @@ template <typename E>
 void PltSection<E>::update_shdr(Context<E> &ctx) {
   if (symbols.empty())
     this->shdr.sh_size = 0;
+  else if constexpr (is_sparc<E>)
+    this->shdr.sh_size = E::plt_hdr_size + symbols.size() * E::plt_size;
   else
     this->shdr.sh_size = to_plt_offset<E>(symbols.size());
 }
@@ -1825,8 +1839,25 @@ void RelPltSection<E>::copy_buf(Context<E> &ctx) {
     // Therefore, it doesn't need a separate section to store the symbol
     // resolution results. That is of course horrible from the security
     // point of view, though.
-    u64 addr = is_sparc<E> ? sym->get_plt_addr(ctx) : sym->get_gotplt_addr(ctx);
-    *buf++ = ElfRel<E>(addr, E::R_JUMP_SLOT, sym->get_dynsym_idx(ctx), 0);
+    if constexpr (is_sparc<E>) {
+      i64 idx = sym->get_plt_idx(ctx);
+      if (idx < sparc_num_small_plt) {
+        *buf++ = ElfRel<E>(sym->get_plt_addr(ctx), E::R_JUMP_SLOT,
+                           sym->get_dynsym_idx(ctx), 0);
+      } else {
+        // A large PLT entry resolves through a data pointer rather than
+        // self-modifying code, so its relocation targets that pointer and
+        // carries -(call address) as the addend, making the loader store
+        // (target - call) there (see arch-sparc64.cc).
+        u64 call = sym->get_plt_addr(ctx) + 4;
+        u64 ptr = ctx.plt->shdr.sh_addr + sparc_plt_ptr_offset(ctx, idx);
+        *buf++ = ElfRel<E>(ptr, E::R_JUMP_SLOT, sym->get_dynsym_idx(ctx),
+                           -call);
+      }
+    } else {
+      *buf++ = ElfRel<E>(sym->get_gotplt_addr(ctx), E::R_JUMP_SLOT,
+                         sym->get_dynsym_idx(ctx), 0);
+    }
   }
 }
 
@@ -2490,6 +2521,136 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
   }
 }
 
+// Lay out the output .sframe section. Like .eh_frame, .sframe is parsed
+// and reconstructed by the linker, so here we pick the FDEs for live
+// functions and arrange the FRE subsection. The header and the PC-sorted
+// FDE index are written later by copy_buf, once addresses are known.
+template <typename E>
+void SFrameSection<E>::construct(Context<E> &ctx) requires supports_sframe<E> {
+  Timer t(ctx, "sframe");
+
+  // Gather the FDEs that describe live functions and total the size of the
+  // FRE subsection. FREs carry no relocations, so their contents are
+  // position-independent and are simply concatenated by copy_buf.
+  for (ObjectFile<E> *file : ctx.objs)
+    for (SFrameFde<E> &fde : file->sframe_fdes)
+      if (fde.isec->is_alive)
+        fdes.push_back(&fde);
+
+  // If no live function has unwind info, leave the section empty so that
+  // it is removed from the output.
+  if (fdes.empty())
+    return;
+
+  // We always emit PC-relative function pointers; we can additionally
+  // mark the index as sorted unless this is a relocatable output,
+  // where the final addresses (and hence the order) aren't known.
+  hdr.magic = SFRAME_MAGIC;
+  hdr.version = 3;
+  hdr.flags = SFRAME_F_FDE_FUNC_START_PCREL |
+              (ctx.arg.relocatable ? 0 : SFRAME_F_FDE_SORTED);
+  hdr.abi_arch = E::sframe_abi;
+  hdr.cfa_fixed_ra_offset = is_x86_64<E> ? -8 : 0;
+  hdr.num_fdes = fdes.size();
+  hdr.freoff = fdes.size() * sizeof(SFrameFdeIdx<E>);
+
+  for (SFrameFde<E> *fde : fdes) {
+    hdr.fre_len += fde->fre.size();
+    hdr.num_fres += fde->num_fres;
+  }
+
+  this->shdr.sh_size =
+    sizeof(hdr) + fdes.size() * sizeof(SFrameFdeIdx<E>) + hdr.fre_len;
+}
+
+// Write the output .sframe section: the header, the FDE index and the
+// concatenated FRE blocks. For an executable or a shared library the index
+// is sorted by function address and func_start is resolved in place. For a
+// relocatable output, addresses aren't known yet, so the index is left
+// unsorted and func_start is emitted as a relocation by SFrameRelocSection.
+template <typename E>
+void SFrameSection<E>::copy_buf(Context<E> &ctx) {
+  // Write the header.
+  u8 *base = ctx.buf + this->shdr.sh_offset;
+  memcpy(base, &hdr, sizeof(hdr));
+
+  SFrameFdeIdx<E> *fde_base = (SFrameFdeIdx<E> *)(base + sizeof(hdr));
+  u8 *fre_base = base + sizeof(hdr) + hdr.freoff;
+
+  // The FDE index must be sorted by function address so that the runtime
+  // can locate an entry by binary search. A relocatable output is the
+  // exception: the addresses aren't known yet, so the index is left in its
+  // current order and SFrameRelocSection emits a func_start relocation for
+  // each entry in that same order.
+  if (!ctx.arg.relocatable) {
+    ranges::sort(fdes, {}, [&](SFrameFde<E> *fde) {
+      return fde->sym->get_addr(ctx) + fde->addend;
+    });
+  }
+
+  // Write the FDE index and concatenate the FRE blocks. Because
+  // SFRAME_F_FDE_FUNC_START_PCREL is set, func_start_offset is the distance
+  // from the field itself to the function the FDE describes.
+  i64 fre_off = 0;
+  for (i64 i = 0; i < fdes.size(); i++) {
+    SFrameFde<E> &fde = *fdes[i];
+    memcpy(fre_base + fre_off, fde.fre.data(), fde.fre.size());
+
+    SFrameFdeIdx<E> &ent = fde_base[i];
+    if (ctx.arg.relocatable) {
+      ent.func_start_offset = 0;
+    } else {
+      u64 func_addr = fde.sym->get_addr(ctx) + fde.addend;
+      u64 field_addr = this->shdr.sh_addr + sizeof(hdr) +
+                       i * sizeof(SFrameFdeIdx<E>);
+      ent.func_start_offset = func_addr - field_addr;
+    }
+    ent.func_size = fde.func_size;
+    ent.func_start_fre_off = fre_off;
+    fre_off += fde.fre.size();
+  }
+}
+
+template <typename E>
+void SFrameRelocSection<E>::update_shdr(Context<E> &ctx) {
+  this->shdr.sh_size = ctx.sframe->fdes.size() * sizeof(ElfRel<E>);
+  this->shdr.sh_link = ctx.symtab->shndx;
+  this->shdr.sh_info = ctx.sframe->shndx;
+}
+
+// Emit one relocation per FDE for its func_start field. The entries are
+// written in the same order as SFrameSection::copy_buf lays out the index.
+template <typename E>
+void SFrameRelocSection<E>::copy_buf(Context<E> &ctx) {
+  if constexpr (supports_sframe<E>) {
+    ElfRel<E> *buf = (ElfRel<E> *)(ctx.buf + this->shdr.sh_offset);
+    std::span<SFrameFde<E> *> fdes = ctx.sframe->fdes;
+
+    for (i64 i = 0; i < fdes.size(); i++) {
+      SFrameFde<E> &fde = *fdes[i];
+      Symbol<E> &sym = *fde.sym;
+
+      ElfRel<E> &r = buf[i];
+      memset(&r, 0, sizeof(r));
+      r.r_offset = ctx.sframe->shdr.sh_addr + sizeof(SFrameHeader<E>) +
+                   i * sizeof(SFrameFdeIdx<E>);
+      r.r_type = E::R_SFRAME;
+
+      if (sym.esym().st_type == STT_SECTION) {
+        // We discard input section symbols and create a fresh one per output
+        // section, so a reference to a section symbol needs its addend
+        // adjusted by the input section's offset in its output section.
+        InputSection<E> *target = sym.get_input_section();
+        r.r_sym = target->output_section->shndx;
+        r.r_addend = fde.addend + target->offset;
+      } else {
+        r.r_sym = sym.get_output_sym_idx(ctx);
+        r.r_addend = fde.addend;
+      }
+    }
+  }
+}
+
 template <typename E>
 void EhFrameHdrSection<E>::update_shdr(Context<E> &ctx) {
   num_fdes = 0;
@@ -3042,60 +3203,67 @@ void RelocSection<E>::update_shdr(Context<E> &ctx) {
   this->shdr.sh_info = output_section.shndx;
 }
 
+// Translates an input relocation's symbol reference into the {r_sym, addend}
+// pair that is valid in the output file. The returned r_sym is either an output
+// section index (for section-relative relocs) or an output symbol table index.
+template <typename E>
+static std::pair<i64, i64>
+get_symidx_addend(Context<E> &ctx, InputSection<E> &isec, const ElfRel<E> &rel) {
+  Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+
+  if (!(isec.shdr().sh_flags & SHF_ALLOC)) {
+    SectionFragment<E> *frag;
+    i64 frag_addend;
+    std::tie(frag, frag_addend) = isec.get_fragment(ctx, rel);
+    if (frag)
+      return {frag->output_section.shndx, frag->offset + frag_addend};
+  }
+
+  if (sym.esym().st_type == STT_SECTION) {
+    if (SectionFragment<E> *frag = sym.get_frag())
+      return {frag->output_section.shndx,
+              frag->offset + sym.value + get_addend(isec, rel)};
+
+    InputSection<E> *isec2 = sym.get_input_section();
+    if (OutputSection<E> *osec = isec2->output_section)
+      return {osec->shndx, get_addend(isec, rel) + isec2->offset};
+
+    // This is usually a dead debug section referring to a
+    // COMDAT-eliminated section.
+    return {0, 0};
+  }
+
+  if (sym.write_to_symtab)
+    return {sym.get_output_sym_idx(ctx), get_addend(isec, rel)};
+  return {0, 0};
+}
+
 template <typename E>
 void RelocSection<E>::copy_buf(Context<E> &ctx) {
-  auto get_symidx_addend = [&](InputSection<E> &isec, const ElfRel<E> &rel)
-      -> std::pair<i64, i64> {
-    Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-
-    if (!(isec.shdr().sh_flags & SHF_ALLOC)) {
-      SectionFragment<E> *frag;
-      i64 frag_addend;
-      std::tie(frag, frag_addend) = isec.get_fragment(ctx, rel);
-      if (frag)
-        return {frag->output_section.shndx, frag->offset + frag_addend};
-    }
-
-    if (sym.esym().st_type == STT_SECTION) {
-      if (SectionFragment<E> *frag = sym.get_frag())
-        return {frag->output_section.shndx,
-                frag->offset + sym.value + get_addend(isec, rel)};
-
-      InputSection<E> *isec2 = sym.get_input_section();
-      if (OutputSection<E> *osec = isec2->output_section)
-        return {osec->shndx, get_addend(isec, rel) + isec2->offset};
-
-      // This is usually a dead debug section referring to a
-      // COMDAT-eliminated section.
-      return {0, 0};
-    }
-
-    if (sym.write_to_symtab)
-      return {sym.get_output_sym_idx(ctx), get_addend(isec, rel)};
-    return {0, 0};
-  };
-
-  auto write = [&](ElfRel<E> &out, InputSection<E> &isec, const ElfRel<E> &rel) {
-    i64 symidx;
-    i64 addend;
-    std::tie(symidx, addend) = get_symidx_addend(isec, rel);
-
-    i64 r_offset = isec.output_section->shdr.sh_addr + isec.offset + rel.r_offset;
-    out = ElfRel<E>(r_offset, rel.r_type, symidx, addend);
-
-    if (ctx.arg.relocatable) {
-      u8 *base = ctx.buf + isec.output_section->shdr.sh_offset + isec.offset;
-      write_addend(base + rel.r_offset, addend, rel);
-    }
-  };
-
   tbb::parallel_for((i64)0, (i64)output_section.members.size(), [&](i64 i) {
     ElfRel<E> *buf = (ElfRel<E> *)(ctx.buf + this->shdr.sh_offset) + offsets[i];
     InputSection<E> &isec = *output_section.members[i];
-    std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
 
-    for (i64 j = 0; j < rels.size(); j++)
-      write(buf[j], isec, rels[j]);
+    i64 j = 0;
+    for (const ElfRel<E> &rel : isec.get_rels(ctx)) {
+      i64 symidx;
+      i64 addend;
+      std::tie(symidx, addend) = get_symidx_addend(ctx, isec, rel);
+
+      i64 r_offset = isec.output_section->shdr.sh_addr + isec.offset + rel.r_offset;
+
+      // On RISC-V and LoongArch, relaxation may have deleted instructions,
+      // shifting this relocation's offset.
+      if constexpr (is_riscv<E> || is_loongarch<E>)
+        r_offset -= get_r_delta(isec, rel.r_offset);
+
+      buf[j++] = ElfRel<E>(r_offset, rel.r_type, symidx, addend);
+
+      if (ctx.arg.relocatable) {
+        u8 *base = ctx.buf + isec.output_section->shdr.sh_offset + isec.offset;
+        write_addend(base + rel.r_offset, addend, rel);
+      }
+    }
   });
 }
 
@@ -3159,6 +3327,8 @@ template class MergedSection<E>;
 template class EhFrameSection<E>;
 template class EhFrameHdrSection<E>;
 template class EhFrameRelocSection<E>;
+template class SFrameSection<E>;
+template class SFrameRelocSection<E>;
 template class CopyrelSection<E>;
 template class VersymSection<E>;
 template class VerneedSection<E>;

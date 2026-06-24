@@ -46,10 +46,10 @@ i64 get_addend(u8 *loc, const ElfRel<E> &rel) {
   switch (rel.r_type) {
   case R_386_8:
   case R_386_PC8:
-    return *loc;
+    return *(i8 *)loc;
   case R_386_16:
   case R_386_PC16:
-    return *(ul16 *)loc;
+    return *(il16 *)loc;
   case R_386_32:
   case R_386_PC32:
   case R_386_GOT32:
@@ -65,7 +65,7 @@ i64 get_addend(u8 *loc, const ElfRel<E> &rel) {
   case R_386_TLS_LDO_32:
   case R_386_SIZE32:
   case R_386_TLS_GOTDESC:
-    return *(ul32 *)loc;
+    return *(il32 *)loc;
   default:
     return 0;
   }
@@ -280,10 +280,10 @@ static u32 relax_tlsdesc_to_le(u8 *loc) {
 
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
-  std::span<const ElfRel<E>> rels = get_rels(ctx);
+  std::span<ElfRel<E>> rels = get_rels(ctx);
 
   for (i64 i = 0; i < rels.size(); i++) {
-    const ElfRel<E> &rel = rels[i];
+    ElfRel<E> &rel = rels[i];
     if (rel.r_type == R_NONE)
       continue;
 
@@ -335,6 +335,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         loc[-2] = insn >> 8;
         loc[-1] = insn;
         *(ul32 *)loc = S + A - GOT;
+        if (ctx.arg.emit_relocs)
+          rel.r_type = R_386_GOTOFF;
       }
       break;
     case R_386_GOTOFF:

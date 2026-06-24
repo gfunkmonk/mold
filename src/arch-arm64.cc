@@ -145,10 +145,10 @@ static bool is_add(u8 *loc) {
 
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
-  std::span<const ElfRel<E>> rels = get_rels(ctx);
+  std::span<ElfRel<E>> rels = get_rels(ctx);
 
   for (i64 i = 0; i < rels.size(); i++) {
-    const ElfRel<E> &rel = rels[i];
+    ElfRel<E> &rel = rels[i];
     if (rel.r_type == R_NONE)
       continue;
 
@@ -163,6 +163,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     auto check = [&](i64 val, i64 lo, i64 hi) {
       check_range(ctx, i, val, lo, hi);
+    };
+
+    auto rewrite = [&](i64 idx, u32 ty) {
+      if (ctx.arg.emit_relocs)
+        rels[idx].r_type = ty;
     };
 
     switch (rel.r_type) {
@@ -208,6 +213,30 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_AARCH64_MOVW_UABS_G3:
       *(ul32 *)loc |= bits(S + A, 63, 48) << 5;
       break;
+    case R_AARCH64_MOVW_PREL_G0:
+      check(S + A - P, -(1 << 15), 1 << 15);
+      write_movn_movz(loc, S + A - P);
+      break;
+    case R_AARCH64_MOVW_PREL_G0_NC:
+      *(ul32 *)loc |= bits(S + A - P, 15, 0) << 5;
+      break;
+    case R_AARCH64_MOVW_PREL_G1:
+      check(S + A - P, -(1LL << 31), 1LL << 31);
+      write_movn_movz(loc, (i64)(S + A - P) >> 16);
+      break;
+    case R_AARCH64_MOVW_PREL_G1_NC:
+      *(ul32 *)loc |= bits(S + A - P, 31, 16) << 5;
+      break;
+    case R_AARCH64_MOVW_PREL_G2:
+      check(S + A - P, -(1LL << 47), 1LL << 47);
+      write_movn_movz(loc, (i64)(S + A - P) >> 32);
+      break;
+    case R_AARCH64_MOVW_PREL_G2_NC:
+      *(ul32 *)loc |= bits(S + A - P, 47, 32) << 5;
+      break;
+    case R_AARCH64_MOVW_PREL_G3:
+      *(ul32 *)loc |= bits(S + A - P, 63, 48) << 5;
+      break;
     case R_AARCH64_ADR_GOT_PAGE:
       if (sym.has_got(ctx)) {
         i64 val = page(G + GOT + A) - page(P);
@@ -222,6 +251,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         u32 reg = bits(*(ul32 *)loc, 4, 0);
         *(ul32 *)(loc + 4) = 0x9100'0000 | (reg << 5) | reg; // ADD
         *(ul32 *)(loc + 4) |= bits(S + A, 11, 0) << 10;
+
+        rewrite(i, R_AARCH64_ADR_PREL_PG_HI21);
+        rewrite(i + 1, R_AARCH64_ADD_ABS_LO12_NC);
         i++;
       }
       break;
@@ -248,6 +280,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
             *(ul32 *)loc = 0xd503'201f;              // nop
             *(ul32 *)(loc + 4) = 0x1000'0000 | reg1; // adr
             write_adr(loc + 4, val);
+            rewrite(i, R_NONE);
+            rewrite(i + 1, R_AARCH64_ADR_PREL_LO21);
             i++;
             break;
           }
@@ -401,13 +435,16 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         write_adrp(loc, val);
       } else {
         *(ul32 *)loc = 0xd503'201f; // nop
+        rewrite(i, R_NONE);
       }
       break;
     case R_AARCH64_TLSDESC_LD64_LO12:
-      if (sym.has_tlsdesc(ctx))
+      if (sym.has_tlsdesc(ctx)) {
         *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 3) << 10;
-      else
+      } else {
         *(ul32 *)loc = 0xd503'201f; // nop
+        rewrite(i, R_NONE);
+      }
       break;
     case R_AARCH64_TLSDESC_ADD_LO12:
       if (sym.has_tlsdesc(ctx)) {
@@ -415,9 +452,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       } else if (sym.has_gottp(ctx)) {
         *(ul32 *)loc = 0x9000'0000; // adrp x0, 0
         write_adrp(loc, page(sym.get_gottp_addr(ctx) + A) - page(P));
+        rewrite(i, R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21);
       } else {
         *(ul32 *)loc = 0xd2a0'0000; // movz x0, 0, lsl #16
         *(ul32 *)loc |= bits(S + A - ctx.tp_addr, 32, 16) << 5;
+        rewrite(i, R_AARCH64_TLSLE_MOVW_TPREL_G1);
       }
       break;
     case R_AARCH64_TLSDESC_CALL:
@@ -426,9 +465,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       } else if (sym.has_gottp(ctx)) {
         *(ul32 *)loc = 0xf940'0000; // ldr x0, [x0, 0]
         *(ul32 *)loc |= bits(sym.get_gottp_addr(ctx) + A, 11, 3) << 10;
+        rewrite(i, R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC);
       } else {
         *(ul32 *)loc = 0xf280'0000; // movk x0, 0
         *(ul32 *)loc |= bits(S + A - ctx.tp_addr, 15, 0) << 5;
+        rewrite(i, R_AARCH64_TLSLE_MOVW_TPREL_G0_NC);
       }
       break;
     default:
@@ -573,6 +614,13 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_AARCH64_MOVW_UABS_G1_NC:
     case R_AARCH64_MOVW_UABS_G2:
     case R_AARCH64_MOVW_UABS_G2_NC:
+    case R_AARCH64_MOVW_PREL_G0:
+    case R_AARCH64_MOVW_PREL_G0_NC:
+    case R_AARCH64_MOVW_PREL_G1:
+    case R_AARCH64_MOVW_PREL_G1_NC:
+    case R_AARCH64_MOVW_PREL_G2:
+    case R_AARCH64_MOVW_PREL_G2_NC:
+    case R_AARCH64_MOVW_PREL_G3:
     case R_AARCH64_PREL16:
     case R_AARCH64_PREL32:
     case R_AARCH64_PREL64:

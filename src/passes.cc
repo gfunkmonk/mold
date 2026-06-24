@@ -152,6 +152,7 @@ void create_synthetic_sections(Context<E> &ctx) {
   ctx.dynsym = push(new DynsymSection<E>);
   ctx.dynstr = push(new DynstrSection<E>);
   ctx.eh_frame = push(new EhFrameSection<E>);
+  ctx.sframe = push(new SFrameSection<E>);
   ctx.copyrel = push(new CopyrelSection<E>(false));
   ctx.copyrel_relro = push(new CopyrelSection<E>(true));
 
@@ -374,12 +375,11 @@ void resolve_symbols(Context<E> &ctx) {
   //
   // Therefore, only let IR files claim ownership for COMDAT keys that have
   // no reachable regular-object owner.
-  tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
+  for (ObjectFile<E> *file : ctx.objs)
     if (file->is_reachable)
       for (ComdatGroup *g : file->lto_comdat_groups)
         if (g && g->owner == (u32)-1)
-          update_minimum(g->owner, file->priority);
-  });
+          g->owner = file->priority;
 
   tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
     if (file->is_reachable)
@@ -444,6 +444,16 @@ void parse_eh_frame_sections(Context<E> &ctx) {
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->parse_ehframe(ctx);
   });
+}
+
+template <typename E>
+void parse_sframe_sections(Context<E> &ctx) {
+  if constexpr (supports_sframe<E>) {
+    Timer t(ctx, "parse_sframe_sections");
+    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+      file->parse_sframe(ctx);
+    });
+  }
 }
 
 template <typename E>
@@ -1948,23 +1958,28 @@ void copy_chunks(Context<E> &ctx) {
   };
 
   // For --relocatable and --emit-relocs, we want to copy non-relocation
-  // sections first. This is because REL-type relocation sections (as
-  // opposed to RELA-type) stores relocation addends to target sections.
+  // sections first, for two reasons. First, REL-type relocation sections (as
+  // opposed to RELA-type) store relocation addends to target sections, so the
+  // targets must be written first. Second, relaxation may retype an emitted
+  // relocation in place while applying relocations (e.g. AArch64 GOT/TLS
+  // relaxations), and RelocSection has to observe the updated type, so it
+  // must run after the target sections.
   //
-  // We also does that for SH4 because despite being RELA, we always need
+  // We also do that for SH4 because despite being RELA, we always need
   // to write addends to relocated places for SH4.
-  auto is_rel = [](Chunk<E> &chunk) {
+  auto copy_last = [](Chunk<E> &chunk) {
     return chunk.shdr.sh_type == SHT_REL ||
-           (is_sh4<E> && chunk.shdr.sh_type == SHT_RELA);
+           (is_sh4<E> && chunk.shdr.sh_type == SHT_RELA) ||
+           chunk.to_reloc_sec();
   };
 
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (!is_rel(*chunk))
+    if (!copy_last(*chunk))
       copy(*chunk);
   });
 
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    if (is_rel(*chunk))
+    if (copy_last(*chunk))
       copy(*chunk);
   });
 
@@ -2184,6 +2199,13 @@ void parse_symbol_version(Context<E> &ctx) {
       if (ver.starts_with('@')) {
         is_default = true;
         ver = ver.substr(1);
+      }
+
+      // Empty version (`foo@@`) is the unversioned default; export it
+      // globally, overriding any `local: *` from apply_version_script().
+      if (ver.empty()) {
+        sym->ver_idx = VER_NDX_GLOBAL;
+        continue;
       }
 
       auto it = verdefs.find(ver);
@@ -2893,6 +2915,12 @@ static i64 set_file_offsets(Context<E> &ctx) {
       // If --start-section is given, addresses may not increase
       // monotonically.
       if (chunks[i]->shdr.sh_addr < first.shdr.sh_addr)
+        break;
+
+      // This section requires larger alignment, we need to adjust the
+      // offset to ensure offset % align == vaddr % align.
+      if (chunks[i]->shdr.sh_addralign > ctx.page_size &&
+          chunks[i]->shdr.sh_addralign > chunks[i - 1]->shdr.sh_addralign)
         break;
 
       i64 gap_size = chunks[i]->shdr.sh_addr - chunks[i - 1]->shdr.sh_addr -
@@ -3646,6 +3674,7 @@ template void create_synthetic_sections(Context<E> &);
 template void resolve_symbols(Context<E> &);
 template void do_lto(Context<E> &);
 template void parse_eh_frame_sections(Context<E> &);
+template void parse_sframe_sections(Context<E> &);
 template void create_merged_sections(Context<E> &);
 template void convert_common_symbols(Context<E> &);
 template void create_output_sections(Context<E> &);
