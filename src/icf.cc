@@ -67,8 +67,6 @@
 #include "mold.h"
 #include "../lib/siphash.h"
 
-#include <array>
-#include <cstdio>
 #include <fstream>
 #include <tbb/concurrent_unordered_map.h>
 #include <tbb/concurrent_vector.h>
@@ -77,24 +75,14 @@
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_sort.h>
 
-static constexpr int64_t HASH_SIZE = 16;
-
-using Digest = std::array<uint8_t, HASH_SIZE>;
-
-namespace std {
-template <> struct hash<Digest> {
-  size_t operator()(const Digest &k) const {
-    static_assert(sizeof(size_t) <= HASH_SIZE);
-    size_t val;
-    memcpy(&val, k.data(), sizeof(size_t));
-    return val;
-  }
-};
-}
-
 namespace mold {
 
-static u8 hmac_key[16];
+struct Digest {
+  u64 hi;
+  u64 lo;
+};
+
+static u8 siphash_key[16];
 
 template <typename E>
 static void uniquify_cies(Context<E> &ctx) {
@@ -146,102 +134,8 @@ static bool is_eligible(Context<E> &ctx, InputSection<E> &isec) {
 }
 
 template <typename E>
-static bool is_leaf(Context<E> &ctx, InputSection<E> &isec) {
-  if (!isec.get_rels(ctx).empty())
-    return false;
-
-  for (FdeRecord<E> &fde : isec.get_fdes())
-    if (fde.get_rels(isec.file).size() > 1)
-      return false;
-
-  return true;
-}
-
-template <typename E>
-struct LeafHasher {
-  size_t operator()(InputSection<E> *isec) const {
-    u64 h = hash_string(isec->contents);
-    for (FdeRecord<E> &fde : isec->get_fdes()) {
-      u64 h2 = hash_string(fde.get_contents(isec->file).substr(8));
-      h = combine_hash(h, h2);
-    }
-    return h;
-  }
-};
-
-template <typename E>
-struct LeafEq {
-  bool operator()(InputSection<E> *a, InputSection<E> *b) const {
-    if (a->contents != b->contents)
-      return false;
-
-    std::span<FdeRecord<E>> x = a->get_fdes();
-    std::span<FdeRecord<E>> y = b->get_fdes();
-
-    if (x.size() != y.size())
-      return false;
-
-    for (i64 i = 0; i < x.size(); i++)
-      if (x[i].get_contents(a->file).substr(8) !=
-          y[i].get_contents(b->file).substr(8))
-        return false;
-    return true;
-  }
-};
-
-// Early merge of leaf nodes, which can be processed without constructing the
-// entire graph. This reduces the vertex count and improves memory efficiency.
-template <typename E>
-static void merge_leaf_nodes(Context<E> &ctx) {
-  Timer t(ctx, "merge_leaf_nodes");
-
-  static Counter eligible("icf_eligibles");
-  static Counter non_eligible("icf_non_eligibles");
-  static Counter leaf("icf_leaf_nodes");
-
-  tbb::concurrent_unordered_map<InputSection<E> *, Atomic<InputSection<E> *>,
-                                LeafHasher<E>, LeafEq<E>> map;
-
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections) {
-      if (!isec || !isec->is_alive)
-        continue;
-
-      if (!is_eligible(ctx, *isec)) {
-        non_eligible++;
-        continue;
-      }
-
-      if (is_leaf(ctx, *isec)) {
-        leaf++;
-        isec->icf_leaf = true;
-        auto [it, inserted] = map.insert({isec.get(), isec.get()});
-        if (!inserted) {
-          InputSection<E> *isec2 = it->second.load();
-          while (isec->get_priority() < isec2->get_priority() &&
-                 !it->second.compare_exchange_strong(isec2, isec.get()));
-        }
-      } else {
-        eligible++;
-        isec->icf_eligible = true;
-      }
-    }
-  });
-
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections) {
-      if (isec && isec->is_alive && isec->icf_leaf) {
-        auto it = map.find(isec.get());
-        assert(it != map.end());
-        isec->leader = it->second;
-      }
-    }
-  });
-}
-
-template <typename E>
 static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
-  SipHash13_128 hasher(hmac_key);
+  SipHash13_128 hasher(siphash_key);
 
   auto hash = [&](auto val) {
     hasher.update((u8 *)&val, sizeof(val));
@@ -263,13 +157,10 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
       hash((u64)frag);
     } else if (!isec) {
       hash('3');
-    } else if (isec->leader) {
-      hash('4');
-      hash((u64)isec->leader);
     } else if (isec->icf_eligible) {
-      hash('5');
+      hash('4');
     } else {
-      hash('6');
+      hash('5');
       hash((u64)isec);
     }
     hash(sym.value);
@@ -297,8 +188,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
     }
   }
 
-  for (i64 i = 0; i < isec.get_rels(ctx).size(); i++) {
-    const ElfRel<E> &rel = isec.get_rels(ctx)[i];
+  for (const ElfRel<E> &rel : isec.get_rels(ctx)) {
     hash(rel.r_offset);
     hash(rel.r_type);
     hash(get_addend(isec, rel));
@@ -306,40 +196,163 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
   }
 
   Digest digest;
-  hasher.finish(digest.data());
+  hasher.finish(&digest);
   return digest;
 }
+
+// A concurrent hash map from digest to section. We use it to count the
+// number of distinct digests and to elect the leader section of each
+// digest's equivalence class.
+//
+// The number of distinct digests cannot exceed the number of digests,
+// so we can allocate a large enough table upfront and never need to
+// grow it.
+//
+// The map is reused across propagation rounds. Instead of clearing the
+// table at the start of each round, we stamp each slot with the round
+// number in which it was written; a slot stamped with an earlier round
+// is treated as vacant.
+//
+// Each slot consists of two 64-bit words and a section pointer. The
+// first word packs the round number, a busy bit, and 48 bits of the
+// digest; the second word holds another 64 bits. An inserter claims a
+// vacant slot by installing the first word with compare-and-swap with
+// the busy bit set, writes the second word and the pointer, and then
+// rewrites the first word with the busy bit cleared to publish the
+// slot. Since the slot index is derived from digest bits that the
+// first word doesn't contain, a successful match effectively compares
+// an entire 128-bit digest, so the map is exact under the same
+// hash-collision assumption the surrounding algorithm is built on.
+//
+// Of all sections inserted with the same digest in the same round, the
+// slot ends up pointing to the one with the lowest priority, which ICF
+// uses as the leader of the digest's equivalence class.
+template <typename E>
+class DigestMap {
+public:
+  DigestMap(i64 n) :
+    mask(bit_ceil(n * 2) - 1),
+    slots(mask + 1) {}
+
+  void next_round() {
+    if (++round == 1 << 15) {
+      // The round number wrapped around, making stale slot stamps
+      // ambiguous, so reset the table. In practice, ICF converges long
+      // before this point.
+      for (Slot &slot : slots)
+        slot.hi = 0;
+      round = 1;
+    }
+  }
+
+  // Returns true if the digest was not in the table.
+  bool insert(const Digest &digest, InputSection<E> *isec) {
+    constexpr u64 busy_bit = 1LL << 48;
+    u64 tag = digest.hi >> 16;
+    u64 value = (round << 49) | tag;
+
+    for (i64 i = digest.hi & mask;; i = (i + 1) & mask) {
+      Slot &slot = slots[i];
+      u64 x = slot.hi.load(std::memory_order_acquire);
+
+      // If the slot was last written in an earlier round, it's vacant;
+      // try to claim it.
+      while ((x >> 49) != round) {
+        if (slot.hi.compare_exchange_weak(x, value | busy_bit,
+                                          std::memory_order_acquire)) {
+          slot.lo = digest.lo;
+          slot.leader = isec;
+          slot.hi.store(value, std::memory_order_release);
+          return true;
+        }
+      }
+
+      // The slot is occupied. If it holds a different digest, try the
+      // next slot.
+      if ((x & 0xffff'ffff'ffff) != tag)
+        continue;
+
+      // The tags match; compare the digest bits in the second word,
+      // waiting for the writer to publish them if the slot is still
+      // being claimed.
+      while (x & busy_bit)
+        x = slot.hi.load(std::memory_order_acquire);
+      if (slot.lo != digest.lo)
+        continue;
+
+      // The digest is already in the table; keep the slot pointing to
+      // the lowest-priority section.
+      InputSection<E> *cur = slot.leader;
+      while (isec->get_priority() < cur->get_priority() &&
+             !slot.leader.compare_exchange_strong(cur, isec));
+      return false;
+    }
+  }
+
+  // Returns the section associated with a digest. The digest must have
+  // been inserted in the current round, and no insertion may be running
+  // concurrently.
+  InputSection<E> *find(const Digest &digest) {
+    u64 value = (round << 49) | (digest.hi >> 16);
+    for (i64 i = digest.hi & mask;; i = (i + 1) & mask)
+      if (slots[i].hi == value && slots[i].lo == digest.lo)
+        return slots[i].leader;
+  }
+
+private:
+  struct Slot {
+    Atomic<u64> hi;
+    Atomic<u64> lo;
+    Atomic<InputSection<E> *> leader;
+  };
+
+  // Time begins in round 1 so that all-zero slots, the initial state
+  // of the table, read as vacant.
+  u64 round = 1;
+  u64 mask;
+  std::vector<Slot> slots;
+};
 
 template <typename E>
 static std::vector<InputSection<E> *> gather_sections(Context<E> &ctx) {
   Timer t(ctx, "gather_sections");
 
-  // Count the number of input sections for each input file.
-  std::vector<i64> num_sections(ctx.objs.size());
+  static Counter eligible("icf_eligibles");
+  static Counter non_eligible("icf_non_eligibles");
+
+  // Count the number of eligible input sections for each input file
+  // and turn the counts into starting indices with a prefix sum.
+  std::vector<i64> indices(ctx.objs.size() + 1);
 
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections)
-      if (isec && isec->is_alive && isec->icf_eligible)
-        num_sections[i]++;
+    for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections) {
+      if (!isec || !isec->is_alive)
+        continue;
+
+      if (is_eligible(ctx, *isec)) {
+        eligible++;
+        isec->icf_eligible = true;
+        indices[i + 1]++;
+      } else {
+        non_eligible++;
+      }
+    }
   });
 
-  std::vector<i64> section_indices(ctx.objs.size());
-  for (i64 i = 0; i < ctx.objs.size() - 1; i++)
-    section_indices[i + 1] = section_indices[i] + num_sections[i];
+  for (i64 i = 1; i < indices.size(); i++)
+    indices[i] += indices[i - 1];
 
-  std::vector<InputSection<E> *> sections(
-    section_indices.back() + num_sections.back());
+  std::vector<InputSection<E> *> sections(indices.back());
 
   // Fill `sections` contents.
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    i64 idx = section_indices[i];
-    for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections)
-      if (isec && isec->is_alive && isec->icf_eligible)
+    i64 idx = indices[i];
+    for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections) {
+      if (isec && isec->is_alive && isec->icf_eligible) {
+        isec->icf_idx = idx;
         sections[idx++] = isec.get();
-  });
-
-  tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
-    sections[i]->icf_idx = i;
+      }
+    }
   });
 
   return sections;
@@ -360,6 +373,13 @@ compute_digests(Context<E> &ctx, std::span<InputSection<E> *> sections) {
 // Build a graph, treating every function as a vertex and every function call
 // as an edge. See the description at the top for a more detailed formulation.
 // We use u32 indices here to improve cache locality.
+//
+// Relocations in a section's FDEs are edges too, because compute_digest
+// hashes eligible relocation targets without identity, and every such
+// target must be represented as an edge to remain distinguishable. In
+// particular, an FDE's reference to an LSDA is an edge; without it, two
+// identical functions whose exception tables catch different types would
+// be folded into one.
 template <typename E>
 static void gather_edges(Context<E> &ctx,
                          std::span<InputSection<E> *> sections,
@@ -367,94 +387,87 @@ static void gather_edges(Context<E> &ctx,
                          std::vector<u32> &edge_indices) {
   Timer t(ctx, "gather_edges");
 
-  if (sections.empty())
-    return;
-
-  std::vector<i64> num_edges(sections.size());
-  edge_indices.resize(sections.size());
+  // Count the number of outgoing edges for each vertex and turn the
+  // counts into starting indices with a prefix sum. The extra entry at
+  // the end makes edge_indices[i + 1] valid for every vertex, so that
+  // vertex i's edges are edge_indices[i] to edge_indices[i + 1].
+  edge_indices.resize(sections.size() + 1);
 
   tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
     InputSection<E> &isec = *sections[i];
     assert(isec.icf_eligible);
 
-    for (i64 j = 0; j < isec.get_rels(ctx).size(); j++) {
-      const ElfRel<E> &rel = isec.get_rels(ctx)[j];
-      Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-      if (!sym.get_frag())
-        if (InputSection<E> *isec = sym.get_input_section())
+    for (FdeRecord<E> &fde : isec.get_fdes())
+      for (const ElfRel<E> &rel : fde.get_rels(isec.file).subspan(1))
+        if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+            InputSection<E> *isec = sym.get_input_section())
           if (isec->icf_eligible)
-            num_edges[i]++;
-    }
+            edge_indices[i + 1]++;
+
+    for (const ElfRel<E> &rel : isec.get_rels(ctx))
+      if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+          InputSection<E> *isec = sym.get_input_section())
+        if (isec->icf_eligible)
+          edge_indices[i + 1]++;
   });
 
-  for (i64 i = 0; i < num_edges.size() - 1; i++)
-    edge_indices[i + 1] = edge_indices[i] + num_edges[i];
+  for (i64 i = 1; i < edge_indices.size(); i++)
+    edge_indices[i] += edge_indices[i - 1];
 
-  edges.resize(edge_indices.back() + num_edges.back());
+  edges.resize(edge_indices.back());
 
-  tbb::parallel_for((i64)0, (i64)num_edges.size(), [&](i64 i) {
+  tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
     InputSection<E> &isec = *sections[i];
     i64 idx = edge_indices[i];
 
-    for (ElfRel<E> &rel : isec.get_rels(ctx)) {
-      Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-      if (InputSection<E> *isec = sym.get_input_section())
+    for (FdeRecord<E> &fde : isec.get_fdes())
+      for (const ElfRel<E> &rel : fde.get_rels(isec.file).subspan(1))
+        if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+            InputSection<E> *isec = sym.get_input_section())
+          if (isec->icf_eligible)
+            edges[idx++] = isec->icf_idx;
+
+    for (const ElfRel<E> &rel : isec.get_rels(ctx))
+      if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+          InputSection<E> *isec = sym.get_input_section())
         if (isec->icf_eligible)
           edges[idx++] = isec->icf_idx;
-  }
   });
 }
 
-template <typename E>
-static i64 propagate(std::span<std::vector<Digest>> digests,
-                     std::span<u32> edges, std::span<u32> edge_indices,
-                     bool &slot, std::span<u8> converged,
-                     tbb::affinity_partitioner &ap) {
-  static Counter round("icf_round");
-  round++;
-
-  i64 num_digests = digests[0].size();
-  tbb::enumerable_thread_specific<i64> changed;
-
-  tbb::parallel_for((i64)0, num_digests, [&](i64 i) {
-    if (converged[i])
-      return;
-
-    SipHash13_128 hasher(hmac_key);
-    hasher.update(digests[2][i].data(), HASH_SIZE);
+// Compute the next-round digest of each vertex by hashing its current
+// digest and the current digests of the vertices it refers to. A
+// vertex's digest after the nth round is therefore a hash of its
+// unfolding into a tree of depth n.
+static void propagate(std::span<Digest> cur, std::span<Digest> next,
+                      std::span<u32> edges, std::span<u32> edge_indices) {
+  tbb::parallel_for((i64)0, (i64)cur.size(), [&](i64 i) {
+    SipHash13_128 hasher(siphash_key);
+    hasher.update(&cur[i], sizeof(Digest));
 
     i64 begin = edge_indices[i];
-    i64 end = (i + 1 == num_digests) ? edges.size() : edge_indices[i + 1];
-
+    i64 end = edge_indices[i + 1];
     for (i64 j : edges.subspan(begin, end - begin))
-      hasher.update(digests[slot][j].data(), HASH_SIZE);
+      hasher.update(&cur[j], sizeof(Digest));
 
-    hasher.finish(digests[!slot][i].data());
+    hasher.finish(&next[i]);
+  });
 
-    if (digests[slot][i] == digests[!slot][i]) {
-      // This node has converged. Skip further iterations as it will
-      // yield the same hash.
-      converged[i] = true;
-    } else {
-      changed.local()++;
-    }
-  }, ap);
-
-  slot = !slot;
-  return changed.combine(std::plus());
+  static Counter counter("icf_round");
+  counter++;
 }
 
 template <typename E>
 static i64 count_num_classes(std::span<Digest> digests,
-                             tbb::affinity_partitioner &ap) {
-  std::vector<Digest> vec(digests.begin(), digests.end());
-  tbb::parallel_sort(vec);
+                             std::span<InputSection<E> *> sections,
+                             DigestMap<E> &map) {
+  map.next_round();
 
   tbb::enumerable_thread_specific<i64> num_classes;
-  tbb::parallel_for((i64)0, (i64)vec.size() - 1, [&](i64 i) {
-    if (vec[i] != vec[i + 1])
+  tbb::parallel_for((i64)0, (i64)digests.size(), [&](i64 i) {
+    if (map.insert(digests[i], sections[i]))
       num_classes.local()++;
-  }, ap);
+  });
   return num_classes.combine(std::plus());
 }
 
@@ -513,102 +526,62 @@ void icf_sections(Context<E> &ctx) {
   if (ctx.objs.empty())
     return;
 
-  get_random_bytes(hmac_key, sizeof(hmac_key));
+  get_random_bytes(siphash_key, sizeof(siphash_key));
 
   uniquify_cies(ctx);
-  merge_leaf_nodes(ctx);
 
   // Prepare for the propagation rounds.
   std::vector<InputSection<E> *> sections = gather_sections(ctx);
 
-  // We allocate 3 arrays to store hashes for each vertex.
-  //
-  // Index 0 and 1 are used for tree hashes from the previous
-  // iteration and the current iteration. They switch roles every
-  // iteration. See `slot` below.
-  //
-  // Index 2 stores the initial, single-vertex hash. This is combined
-  // with hashes from the connected vertices to form the tree hash
-  // described above.
-  std::vector<std::vector<Digest>> digests(3);
-  digests[0] = compute_digests<E>(ctx, sections);
-  digests[1].resize(digests[0].size());
-  digests[2] = digests[0];
+  // `digests` holds the current digest of each vertex; `scratch` is
+  // where a propagation round writes the next digests before the two
+  // vectors swap roles.
+  std::vector<Digest> digests = compute_digests<E>(ctx, sections);
+  std::vector<Digest> scratch(digests.size());
 
   std::vector<u32> edges;
   std::vector<u32> edge_indices;
   gather_edges<E>(ctx, sections, edges, edge_indices);
 
-  std::vector<u8> converged(digests[0].size());
-  bool slot = 0;
+  // The digest map is used to count the number of distinct digests in
+  // the loop below. As a side effect, it records the lowest-priority
+  // section for each digest, which the grouping step after the loop
+  // uses as the leader of each equivalence class.
+  DigestMap<E> map(digests.size());
 
   // Execute the propagation rounds until convergence is obtained.
+  //
+  // The number of distinct digests can only monotonically increase as
+  // the rounds hash ever-deeper trees, so once two consecutive rounds
+  // yield the same count, the partition of sections into equivalence
+  // classes has stopped changing and will remain unchanged for further
+  // iterations (proof omitted for brevity). Note that individual
+  // digests may well still be changing at that point; sections that
+  // have a cycle in downstream (i.e. recursive functions and functions
+  // that call them) never settle on a digest. That doesn't matter
+  // because sections in the same class change their digests in
+  // lockstep, keeping the partition intact.
   {
     Timer t(ctx, "propagate");
-    tbb::affinity_partitioner ap;
-
-    // A cheap test that the graph hasn't converged yet.
-    // The loop after this one uses a strict condition, but it's expensive
-    // as it requires sorting the entire hash collection.
-    //
-    // For nodes that have a cycle in downstream (i.e. recursive
-    // functions and functions that calls recursive functions) will always
-    // change with the iterations. Nodes that doesn't (i.e. non-recursive
-    // functions) will stop changing as soon as the propagation depth reaches
-    // the call tree depth.
-    // Here, we test whether we have reached sufficient depth for the latter,
-    // which is a necessary (but not sufficient) condition for convergence.
-    i64 num_changed = -1;
-    for (;;) {
-      i64 n = propagate<E>(digests, edges, edge_indices, slot, converged, ap);
-      if (n == num_changed)
-        break;
-      num_changed = n;
-    }
-
-    // Run the pass until the unique number of hashes stop increasing, at which
-    // point we have achieved convergence (proof omitted for brevity).
     i64 num_classes = -1;
-    for (;;) {
-      // count_num_classes requires sorting which is O(n log n), so do a little
-      // more work beforehand to amortize that log factor.
-      for (i64 i = 0; i < 10; i++)
-        propagate<E>(digests, edges, edge_indices, slot, converged, ap);
 
-      i64 n = count_num_classes<E>(digests[slot], ap);
-      if (n == num_classes)
+    for (;;) {
+      propagate(digests, scratch, edges, edge_indices);
+      std::swap(digests, scratch);
+      i64 m = count_num_classes<E>(digests, sections, map);
+      if (m == num_classes)
         break;
-      num_classes = n;
+      num_classes = m;
     }
   }
 
-  // Group sections by hash values.
+  // Group sections by digest. The final counting round has already
+  // elected a leader for each digest; look it up.
   {
     Timer t(ctx, "group");
-
-    auto *map =
-      new tbb::concurrent_unordered_map<Digest, Atomic<InputSection<E> *>>;
-
-    std::span<Digest> digest = digests[slot];
-
     tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
-      InputSection<E> *isec = sections[i];
-      auto [it, inserted] = map->insert({digest[i], isec});
-      if (!inserted) {
-        InputSection<E> *isec2 = it->second.load();
-        while (isec->get_priority() < isec2->get_priority() &&
-               !it->second.compare_exchange_strong(isec2, isec));
-      }
+      sections[i]->leader = map.find(digests[i]);
     });
-
-    tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
-      auto it = map->find(digest[i]);
-      assert(it != map->end());
-      sections[i]->leader = it->second;
-    });
-
-    // Since free'ing the map is slow, postpone it.
-    ctx.on_exit.push_back([=] { delete map; });
   }
 
   if (!ctx.arg.print_icf_sections.empty())
@@ -618,11 +591,9 @@ void icf_sections(Context<E> &ctx) {
   {
     Timer t(ctx, "update_alignment");
     tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-      for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
-        if (isec && isec->is_alive && isec->leader && isec->leader != isec.get()) {
+      for (std::unique_ptr<InputSection<E>> &isec : file->sections)
+        if (isec && isec->is_alive && isec->icf_removed())
           update_maximum(isec->leader->p2align, isec->p2align);
-        }
-      }
     });
   }
 
