@@ -15,8 +15,10 @@ template <typename E>
 static bool should_keep(const InputSection<E> &isec) {
   u32 type = isec.shdr().sh_type;
   u32 flags = isec.shdr().sh_flags;
+  std::string_view name = isec.name();
+
   if constexpr (is_ppc32<E>)
-    if (isec.name == ".got2")
+    if (name == ".got2")
       return true;
 
   return (flags & SHF_GNU_RETAIN) ||
@@ -24,10 +26,10 @@ static bool should_keep(const InputSection<E> &isec) {
          type == SHT_INIT_ARRAY ||
          type == SHT_FINI_ARRAY ||
          type == SHT_PREINIT_ARRAY ||
-         isec.name.starts_with(".ctors") ||
-         isec.name.starts_with(".dtors") ||
-         isec.name.starts_with(".init") ||
-         isec.name.starts_with(".fini");
+         name.starts_with(".ctors") ||
+         name.starts_with(".dtors") ||
+         name.starts_with(".init") ||
+         name.starts_with(".fini");
 }
 
 // Sections whose names are valid C identifiers can be referenced via
@@ -37,16 +39,18 @@ static bool should_keep(const InputSection<E> &isec) {
 // of a given name when we encounter such a reference during marking.
 template <typename E>
 using StartStopMap =
-  tbb::concurrent_unordered_multimap<std::string_view, InputSection<E> *>;
+  tbb::concurrent_unordered_map<std::string_view,
+                                tbb::concurrent_vector<InputSection<E> *>>;
 
 template <typename E>
 static StartStopMap<E> build_start_stop_map(Context<E> &ctx) {
   StartStopMap<E> map;
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections)
-      if (isec && isec->is_alive && (isec->shdr().sh_flags & SHF_ALLOC) &&
-          is_c_identifier(isec->name))
-        map.insert({isec->name, isec.get()});
+    for (InputSection<E> *isec : file->sections)
+      if (isec && isec->is_alive && (isec->shdr().sh_flags & SHF_ALLOC))
+        if (std::string_view name = isec->name();
+            is_c_identifier(name))
+          map[name].push_back(isec);
   });
   return map;
 }
@@ -78,7 +82,7 @@ collect_root_set(Context<E> &ctx) {
 
   // Add sections that are not subject to garbage collection.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
+    for (InputSection<E> *isec : file->sections) {
       if (!isec || !isec->is_alive)
         continue;
 
@@ -92,7 +96,7 @@ collect_root_set(Context<E> &ctx) {
       }
 
       if (should_keep(*isec))
-        enqueue_section(isec.get());
+        enqueue_section(isec);
     }
   });
 
@@ -164,13 +168,24 @@ static void visit_section(Context<E> &ctx, InputSection<E> *isec,
 
     mark(sym.get_input_section());
 
-    // A reference to __start_<name> or __stop_<name> keeps every section
-    // named <name> alive, mirroring how those symbols are defined.
-    if (std::string_view sec = start_stop_name(sym.name());
-        !sec.empty()) {
-      auto [i, end] = start_stop_map.equal_range(sec);
-      for (; i != end; ++i)
-        mark(i->second);
+    // A reference to __start_<name> or __stop_<name> keeps every
+    // section named <name> alive, mirroring how those symbols are
+    // defined. A single such reference can keep an enormous number of
+    // sections alive, so we spread the fanout over threads instead
+    // of marking the sections one by one.
+    if (std::string_view name = start_stop_name(sym.name());
+        !name.empty()) {
+      if (auto it = start_stop_map.find(name);
+          it != start_stop_map.end()) {
+        // Mark and visit the sections with a nested parallel loop.
+        // As in mark() below, a section added to a feeder has
+        // already been marked, so a feeder's loop body must visit
+        // it unconditionally.
+        tbb::parallel_for_each(it->second, [&](InputSection<E> *isec) {
+          if (mark_section(isec))
+            visit_section(ctx, isec, feeder, 0, start_stop_map);
+        });
+      }
     }
   }
 
@@ -201,10 +216,10 @@ static void sweep(Context<E> &ctx) {
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     ObjectFile<E> &file = *ctx.objs[i];
 
-    for (std::unique_ptr<InputSection<E>> &isec : file.sections) {
+    for (InputSection<E> *isec : file.sections) {
       if (isec && isec->is_alive && !isec->is_visited) {
         isec->kill();
-        sections[i].push_back(isec.get());
+        sections[i].push_back(isec);
       }
     }
   });

@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -18,12 +19,15 @@
 #include <tbb/concurrent_vector.h>
 #include <tbb/global_control.h>
 #include <tbb/spin_mutex.h>
+#include <tbb/task_arena.h>
 #include <tbb/task_group.h>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
+
+#define ALWAYS_INLINE __attribute__((always_inline))
 
 #ifdef _WIN32
 # include <windows.h>
@@ -53,6 +57,13 @@ template <typename E> struct Context;
 template <typename E> struct FdeRecord;
 template <typename E> class MergeableSection;
 template <typename E> class RelocSection;
+template <typename E> struct SectionFragment;
+
+// Local symbols in discarded COMDAT sections all use one zero-valued symbol.
+template <typename E>
+inline Symbol<E> *discarded_comdat_sym;
+
+struct GdbIndexData;
 
 struct ReaderContext;
 
@@ -267,15 +278,25 @@ void release_global_lock();
 
 template <typename E>
 struct __attribute__((aligned(4))) SectionFragment {
-  SectionFragment(MergedSection<E> *sec, bool is_alive)
-    : output_section(*sec), is_alive(is_alive) {}
+  SectionFragment(Context<E> &ctx, MergedSection<E> &sec, bool is_alive)
+    : output_section_arena_idx(ctx.arena.get_index(&sec)),
+      is_alive(is_alive) {}
 
   u64 get_addr(Context<E> &ctx) const {
-    return output_section.shdr.sh_addr + offset;
+    return get_output_section(ctx).shdr.sh_addr + offset;
   }
 
-  MergedSection<E> &output_section;
+  MergedSection<E> &get_output_section(Context<E> &ctx) const {
+    return *ctx.arena.template get_pointer<MergedSection<E>>(
+      output_section_arena_idx);
+  }
+
   i64 offset = -1;
+
+  // SectionFragment lives in a separately mapped hash table, so it cannot use
+  // ArenaPtr.
+  u32 output_section_arena_idx;
+
   Atomic<u8> p2align = 0;
   Atomic<bool> is_alive = false;
 
@@ -515,11 +536,14 @@ struct InputSectionExtras<E> {
   std::vector<RelocDelta> r_deltas;
 };
 
-// InputSection represents a section in an input object file.
+// InputSection represents a section in an input object file. Symbol::origin
+// uses the low two bits of an InputSection pointer, so keep this type
+// four-byte aligned even on hosts such as m68k.
 template <typename E>
 class __attribute__((aligned(4))) InputSection {
 public:
-  InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx);
+  InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx,
+               std::string_view section_name);
 
   void uncompress(Context<E> &ctx);
   void copy_contents_to(Context<E> &ctx, u8 *buf, i64 sz);
@@ -531,8 +555,15 @@ public:
 
   i64 get_priority() const;
   u64 get_addr() const;
+  std::string_view name() const;
+  std::string_view get_contents() const;
   ElfShdr<E> &shdr() const;
   std::span<ElfRel<E>> get_rels(Context<E> &ctx) const;
+
+  // Visit relocations without materializing a CREL table unless another pass
+  // has already decoded it. The callback must be always-inline because this
+  // function may invoke it millions of times.
+  void for_each_reloc(Context<E> &ctx, auto fn) const;
   std::span<FdeRecord<E>> get_fdes() const;
   std::string_view get_func_name(Context<E> &ctx, i64 offset) const;
   bool is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel) const;
@@ -545,37 +576,31 @@ public:
 
   ObjectFile<E> &file;
   OutputSection<E> *output_section = nullptr;
+
+  // contents initially points into the input file and is replaced with an
+  // uncompressed buffer when necessary. sh_size is the section size after
+  // decompression and may shrink during relaxation.
+  u8 *contents = nullptr;
+
   i64 sh_size = -1;
-
-  std::string_view name;
-  std::string_view contents;
-
+  i64 offset = -1;
   i32 fde_begin = -1;
   i32 fde_end = -1;
-
-  i64 offset = -1;
   i32 shndx = -1;
   i32 relsec_idx = -1;
 
+  // UINT16_MAX means that name() must scan the remaining suffix.
+  u16 namelen = 0;
+
+  Atomic<u8> p2align = 0;
+  Atomic<bool> is_alive = true;       // for COMDAT and garbage collection
+  Atomic<bool> is_visited = false;    // for garbage collection
+  Atomic<bool> address_taken = false; // for ICF
   bool uncompressed = false;
 
-  // For COMDAT de-duplication and garbage collection
-  Atomic<bool> is_alive = true;
-  Atomic<u8> p2align = 0;
-
-  // For ICF
-  Atomic<bool> address_taken = false;
-
-  // For garbage collection
-  Atomic<bool> is_visited = false;
-
-  // For ICF
-  //
-  // `leader` is the section that this section has been merged with.
-  // Three kind of values are possible:
-  // - `leader == nullptr`: This section was not eligible for ICF.
-  // - `leader == this`: This section was retained.
-  // - `leader != this`: This section was merged with another identical section.
+  // `leader` is the section that this section has been merged with by ICF.
+  // It is null for ineligible sections, points to this for retained sections,
+  // and points to another section for removed sections.
   InputSection<E> *leader = nullptr;
   u32 icf_idx = -1;
   bool icf_eligible = false;
@@ -666,13 +691,16 @@ public:
   virtual void copy_buf(Context<E> &ctx) {}
   virtual void write_to(Context<E> &ctx, u8 *buf) { unreachable(); }
   virtual void update_shdr(Context<E> &ctx) {}
+  virtual i64 get_num_dynrels(Context<E> &) const { return 0; }
+  virtual std::vector<u64> get_relr_offsets(Context<E> &) { return {}; }
 
-  virtual std::vector<ElfRel<E>>
-  collect_dynrels(Context<E> &ctx) const { return {}; }
+  virtual void write_dynrels(Context<E> &, ElfRel<E> *) const { unreachable(); }
 
   std::string_view name;
   ElfShdr<E> shdr = { .sh_addralign = 1 };
   i64 shndx = 0;
+  i64 num_dynrels = 0;
+  i64 num_relrs = 0;
   bool is_relro = false;
 
   // For --gdb-index
@@ -793,7 +821,9 @@ public:
 
   OutputSection<E> *to_osec() override { return this; }
   void compute_section_size(Context<E> &ctx) override;
-  std::vector<ElfRel<E>> collect_dynrels(Context<E> &ctx) const override;
+  i64 get_num_dynrels(Context<E> &ctx) const override;
+  std::vector<u64> get_relr_offsets(Context<E> &ctx) override;
+  void write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const override;
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
 
@@ -807,6 +837,8 @@ public:
   std::vector<std::unique_ptr<Thunk<E>>> thunks;
   std::unique_ptr<RelocSection<E>> reloc_sec;
   std::vector<AbsRel<E>> abs_rels;
+  std::vector<i64> dynrel_offsets;
+  std::vector<i64> relr_offsets;
   Atomic<u32> sh_flags;
 
   // Used only by create_output_sections()
@@ -840,7 +872,9 @@ public:
 
   u64 get_tlsld_addr(Context<E> &ctx) const;
   bool has_tlsld(Context<E> &ctx) const { return tlsld_idx != -1; }
-  std::vector<ElfRel<E>> collect_dynrels(Context<E> &ctx) const override;
+  i64 get_num_dynrels(Context<E> &ctx) const override;
+  std::vector<u64> get_relr_offsets(Context<E> &ctx) override;
+  void write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const override;
   void copy_buf(Context<E> &ctx) override;
 
   void compute_symtab_size(Context<E> &ctx) override;
@@ -963,6 +997,8 @@ public:
 
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
+
+  void write_relocs(Context<E> &ctx, ElfRel<E> *buf);
 
   std::vector<ElfRel<E>> relocs;
   std::vector<u8> android_encoded;
@@ -1361,7 +1397,8 @@ public:
   }
 
   void add_symbol(Context<E> &ctx, Symbol<E> *sym);
-  std::vector<ElfRel<E>> collect_dynrels(Context<E> &ctx) const override;
+  i64 get_num_dynrels(Context<E> &ctx) const override;
+  void write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const override;
 
   std::vector<Symbol<E> *> symbols;
 };
@@ -1608,11 +1645,16 @@ public:
   open(Context<E> &ctx, std::string path, i64 filesize, int perm);
 
   virtual void close(Context<E> &ctx) = 0;
-  virtual ~OutputFile() { free(buf2); }
+  virtual ~OutputFile() = default;
+
+  // Appends `size` bytes to the output file and returns a pointer to
+  // the newly-allocated space, bumping `filesize` accordingly. We use
+  // it for .gdb_index, whose size is not known until all other
+  // sections have been written. The new space is zero-initialized.
+  // `buf` and `ctx.buf` may move as a result of this call.
+  virtual u8 *extend(Context<E> &ctx, i64 size) = 0;
 
   u8 *buf = nullptr;
-  u8 *buf2 = nullptr;
-  i64 buf2_size = 0;
   std::string path;
   int fd = -1;
   i64 filesize = 0;
@@ -1628,9 +1670,25 @@ template <typename E>
 class MallocOutputFile : public OutputFile<E> {
 public:
   MallocOutputFile(Context<E> &ctx, std::string path, i64 filesize, int perm)
-    : OutputFile<E>(path, filesize, false), ptr(new u8[filesize]),
-      perm(perm) {
-    this->buf = ptr.get();
+    : OutputFile<E>(path, filesize, false), perm(perm) {
+    this->buf = (u8 *)calloc(filesize, 1);
+    if (!this->buf)
+      Fatal(ctx) << "calloc failed: " << errno_string();
+  }
+
+  ~MallocOutputFile() { free(this->buf); }
+
+  u8 *extend(Context<E> &ctx, i64 size) override {
+    this->buf = (u8 *)realloc(this->buf, this->filesize + size);
+    if (!this->buf)
+      Fatal(ctx) << "realloc failed: " << errno_string();
+
+    u8 *space = this->buf + this->filesize;
+    memset(space, 0, size);
+
+    this->filesize += size;
+    ctx.buf = this->buf;
+    return space;
   }
 
   void close(Context<E> &ctx) override {
@@ -1656,13 +1714,10 @@ public:
     }
 
     fwrite(this->buf, this->filesize, 1, fp);
-    if (this->buf2)
-      fwrite(this->buf2, this->buf2_size, 1, fp);
     fclose(fp);
   }
 
 private:
-  std::unique_ptr<u8[]> ptr;
   int perm;
 };
 
@@ -1671,47 +1726,52 @@ class LockingOutputFile : public OutputFile<E> {
 public:
   LockingOutputFile(Context<E> &ctx, std::string path, int perm);
   void resize(Context<E> &ctx, i64 filesize);
+  u8 *extend(Context<E> &ctx, i64 size) override;
   void close(Context<E> &ctx) override;
+
+private:
+  // Size of the file mapping, which may extend past the end of the file.
+  i64 vasize = 0;
 };
 
 //
 // gdb-index.cc
 //
 
+template <typename E> void read_gdb_index_inputs(Context<E> &ctx);
+template <typename E> void build_gdb_index_tables(Context<E> &ctx);
 template <typename E> void write_gdb_index(Context<E> &ctx);
 
 //
 // input-files.cc
 //
 
-// A comdat section typically represents an inline function,
-// which are de-duplicated by the linker.
-//
-// For each inline function, there's one comdat section, which
-// contains section indices of the function code and its data such as
-// string literals, if any.
-//
-// Comdat sections are identified by its signature. If two comdat
-// sections have the same signature, the linker picks up one and
-// discards the other by eliminating all sections that the other
-// comdat section refers to.
-struct ComdatGroup {
-  // The file priority of the owner file of this comdat section.
-  Atomic<u32> owner = -1;
-};
-
+// A COMDAT group usually contains an inline function's code and related data,
+// such as its string literals. Groups are identified by a signature. If two
+// groups have the same signature, the linker keeps one and discards the
+// sections in the other.
 template <typename E>
 struct ComdatGroupRef {
-  ComdatGroup *group;
+  ComdatGroupRef(Context<E> &ctx, Symbol<E> *sym, i32 sect_idx)
+    : sect_idx(sect_idx), signature_arena_idx(ctx.arena.get_index(sym)) {}
+
+  Symbol<E> *signature(Context<E> &ctx) const;
+  std::span<U32<E>> members(ObjectFile<E> &file) const;
+
   i32 sect_idx;
-  std::span<U32<E>> members;
+
+  // The vector backing comdat_groups is outside the arena, so it cannot use
+  // ArenaPtr. The arena has at most 2^31 four-byte slots, leaving the high bit
+  // for is_owner.
+  u32 signature_arena_idx : 31;
+  u32 is_owner : 1 = false;
 };
 
 template <typename E>
 class MergeableSection {
 public:
   MergeableSection(Context<E> &ctx, MergedSection<E> &parent,
-                   std::unique_ptr<InputSection<E>> &isec);
+                   InputSection<E> *isec);
 
   void split_contents(Context<E> &ctx);
   void resolve_contents(Context<E> &ctx);
@@ -1720,7 +1780,7 @@ public:
 
   MergedSection<E> &parent;
   u8 p2align = 0;
-  std::unique_ptr<InputSection<E>> input_section;
+  InputSection<E> *input_section = nullptr;
   std::vector<SectionFragment<E> *> fragments;
 
 private:
@@ -1728,12 +1788,97 @@ private:
   std::vector<u32> hashes;
 };
 
+// ObjectFile needs a lookup table indexed by ELF section number. Store 31-bit
+// indices into per-file pools and use the high bit to distinguish regular and
+// mergeable sections.
+template <typename E>
+class InputSectionTable {
+public:
+  class Iterator {
+  public:
+    Iterator(InputSectionTable &table, i64 idx)
+      : table(table), idx(idx) {}
+
+    InputSection<E> *operator*() const { return table[idx]; }
+
+    Iterator &operator++() {
+      idx++;
+      return *this;
+    }
+
+    bool operator!=(const Iterator &other) const { return idx != other.idx; }
+
+  private:
+    InputSectionTable &table;
+    i64 idx;
+  };
+
+  InputSection<E> *operator[](i64 idx);
+  MergeableSection<E> *get_mergeable(i64 idx);
+  InputSection<E> *emplace(Context<E> &ctx, ObjectFile<E> &file, i64 shndx,
+                           std::string_view name);
+  void erase(i64 idx) { indices[idx] = 0; }
+  void set_mergeable(i64 idx, std::unique_ptr<MergeableSection<E>> m);
+
+  Iterator begin() { return {*this, 0}; }
+  Iterator end() { return {*this, (i64)indices.size()}; }
+
+  void resize(i64 size) { indices.resize(size); }
+  i64 size() const { return indices.size(); }
+  bool empty() const { return indices.empty(); }
+
+private:
+  static constexpr u32 MERGEABLE = 1U << 31;
+  static constexpr u32 INDEX_MASK = ~MERGEABLE;
+
+  std::deque<InputSection<E>> pool;
+  std::vector<std::unique_ptr<MergeableSection<E>>> mergeable_pool;
+  std::vector<u32> indices;
+};
+
+// Store short name lengths exactly. A long name stores a logarithmic lower
+// bound so that finding its exact length requires scanning only its suffix.
+class NameLen {
+public:
+  NameLen() = default;
+
+  NameLen(i64 len) {
+    if (len < LONG_NAME) {
+      value = len;
+      return;
+    }
+    i64 log2 = std::bit_width((u64)(len - LONG_NAME + 1)) - 1;
+    value = LONG_NAME + std::min<i64>(log2, UINT8_MAX - LONG_NAME);
+  }
+
+  bool is_long() const {
+    return value >= LONG_NAME;
+  }
+
+  std::string_view get_string(const char *str) const {
+    i64 len = lower_bound();
+    if (is_long())
+      len += strlen(str + len);
+    return std::string_view(str, len);
+  }
+
+  i64 lower_bound() const {
+    if (!is_long())
+      return value;
+    return LONG_NAME - 1 + (i64(1) << (value - LONG_NAME));
+  }
+
+private:
+  static constexpr u8 LONG_NAME = 240;
+  u8 value = 0;
+};
+
 // InputFile is the base class of ObjectFile and SharedFile.
 template <typename E>
 class InputFile {
 public:
   InputFile(Context<E> &ctx, MappedFile *mf);
-  InputFile() : filename("<internal>") {}
+  InputFile(Context<E> &ctx);
 
   virtual ~InputFile() = default;
 
@@ -1755,14 +1900,16 @@ public:
   mark_live_objects(Context<E> &ctx,
                     std::function<void(InputFile<E> *)> feeder) = 0;
 
-  std::span<Symbol<E> *> get_local_syms();
-  std::span<Symbol<E> *> get_global_syms();
+  std::span<ArenaPtr<Symbol<E>>> get_local_syms();
+  std::span<ArenaPtr<Symbol<E>>> get_global_syms();
+  ObjectFile<E> *to_obj();
+  SharedFile<E> *to_dso();
   std::string_view get_source_name() const;
 
   MappedFile *mf = nullptr;
   std::span<ElfShdr<E>> elf_sections;
   std::span<ElfSym<E>> elf_syms;
-  std::vector<Symbol<E> *> symbols;
+  std::vector<ArenaPtr<Symbol<E>>, ArenaAllocator<ArenaPtr<Symbol<E>>>> symbols;
   i64 first_global = 0;
 
   std::string filename;
@@ -1772,10 +1919,15 @@ public:
   std::string_view shstrtab;
   std::string_view symbol_strtab;
 
-  // Parallel to elf_syms; cached to avoid per-call strlen.
-  std::vector<std::string_view> symbol_names;
+  // Parallel to elf_syms; avoids rescanning complete symbol names.
+  std::vector<NameLen> symname_lens;
 
-  void populate_symbol_names();
+  void populate_symbol_name_lengths();
+
+  std::string_view get_symbol_name(i64 i) const {
+    const char *p = symbol_strtab.data() + elf_syms[i].st_name;
+    return symname_lens[i].get_string(p);
+  }
 
   bool as_needed = false;
   bool has_init_array = false;
@@ -1793,8 +1945,8 @@ public:
   std::vector<i32> output_sym_indices;
 
 protected:
-  std::vector<Symbol<E>> local_syms;
-  std::vector<Symbol<E>> frag_syms;
+  std::span<Symbol<E>> local_syms;
+  std::span<Symbol<E>> frag_syms;
 };
 
 template <typename E>
@@ -1812,17 +1964,23 @@ struct ObjectFileExtras<PPC32> {
   InputSection<PPC32> *got2 = nullptr;
 };
 
+template <typename E>
+ExactArray<ElfRel<E>> decode_crel(Context<E> &ctx, ObjectFile<E> &file,
+                                  const ElfShdr<E> &shdr);
+
 // ObjectFile represents an input .o file.
 template <typename E>
 class ObjectFile : public InputFile<E> {
 public:
-  ObjectFile() = default;
+  ObjectFile(Context<E> &ctx) : InputFile<E>(ctx) {}
 
   ObjectFile(Context<E> &ctx, MappedFile *mf, std::string archive_name)
     : InputFile<E>(ctx, mf), archive_name(archive_name) {}
 
-  void parse(Context<E> &ctx);
-  void initialize_symbols(Context<E> &ctx);
+  void parse_symbols(Context<E> &ctx);
+  void read_section_metadata(Context<E> &ctx);
+  void parse_sections(Context<E> &ctx, bool keep_discarded_comdat);
+  void register_global_symbols(Context<E> &ctx);
   void parse_ehframe(Context<E> &ctx);
   void parse_sframe(Context<E> &ctx) requires supports_sframe<E>;
   void convert_mergeable_sections(Context<E> &ctx);
@@ -1838,19 +1996,24 @@ public:
 
   i64 get_shndx(const ElfSym<E> &esym);
   InputSection<E> *get_section(const ElfSym<E> &esym);
+  bool is_discarded_comdat(const ElfSym<E> &esym);
 
   std::string archive_name;
-  std::vector<std::unique_ptr<InputSection<E>>> sections;
-  std::vector<std::unique_ptr<MergeableSection<E>>> mergeable_sections;
+
+  InputSectionTable<E> sections;
+  bool sections_parsed = false;
+
   std::vector<ElfShdr<E>> elf_sections2;
   std::vector<CieRecord<E>> cies;
   std::vector<FdeRecord<E>> fdes;
   std::vector<bool> has_symver;
   std::vector<ComdatGroupRef<E>> comdat_groups;
+  std::vector<bool> comdat_discarded;
+
   std::vector<InputSection<E> *> eh_frame_sections;
   std::vector<InputSection<E> *> sframe_sections;
   std::vector<SFrameFde<E>> sframe_fdes;
-  std::vector<std::vector<ElfRel<E>>> decoded_crel;
+  std::vector<ExactArray<ElfRel<E>>> decoded_crel;
   bool exclude_libs = false;
   std::map<u32, u32> gnu_properties;
   bool needs_executable_stack = false;
@@ -1864,7 +2027,7 @@ public:
   i64 fde_size = 0;
 
   // For ICF
-  std::unique_ptr<InputSection<E>> llvm_addrsig;
+  InputSection<E> *llvm_addrsig = nullptr;
 
   // For .gdb_index
   InputSection<E> *debug_info = nullptr;
@@ -1873,10 +2036,12 @@ public:
 
   // For LTO
   std::vector<ElfSym<E>> lto_elf_syms;
-  std::vector<ComdatGroup *> lto_comdat_groups;
+  std::vector<Symbol<E> *> lto_comdat_signatures;
+  std::vector<bool> lto_comdat_discarded;
 
 private:
   void initialize_sections(Context<E> &ctx);
+  void initialize_local_symbols(Context<E> &ctx);
   void sort_relocations(Context<E> &ctx);
   void initialize_ehframe_sections(Context<E> &ctx);
   void parse_note_gnu_property(Context <E> &ctx, const ElfShdr <E> &shdr);
@@ -1942,7 +2107,43 @@ struct ReaderContext {
   bool in_lib = false;
   bool static_ = false;
   bool whole_archive = false;
-  tbb::task_group *tg = nullptr;
+
+  // The position of the file currently being read in the command
+  // line. We read input files in parallel, so files are not read in
+  // the command line order; instead, we record each file's position
+  // when it's found and sort files by position afterwards.
+  //
+  // Positions are hierarchical: the n-th file found inside another
+  // file, such as an archive member or a file named by a GROUP linker
+  // script command, gets its parent file's position extended with n.
+  // Comparing positions lexicographically thus gives the command line
+  // order.
+  std::vector<u32> pos;
+
+  // The number of files found so far in the current file.
+  u32 num_children = 0;
+
+  // Returns a context for the next file found inside the current file.
+  ReaderContext next_child() {
+    ReaderContext child = *this;
+    child.pos.push_back(num_children++);
+    child.num_children = 0;
+    return child;
+  }
+};
+
+// A file to read along with the reader state at its command line
+// position. parse_nonpositional_args() creates one ReaderJob per
+// input file argument; `name` is a path or, if `is_lib` is set, a
+// library name to search for. read_input_files() additionally
+// enqueues archive members as jobs in an already-opened form, with
+// `mf` and `archive_name` set instead.
+struct ReaderJob {
+  ReaderContext rctx;
+  std::string name;
+  bool is_lib = false;
+  MappedFile *mf = nullptr;
+  std::string archive_name;
 };
 
 struct DynamicPattern {
@@ -2099,7 +2300,7 @@ template <typename E>
 std::vector<std::string_view> expand_response_files(Context<E> &ctx, char **argv);
 
 template <typename E>
-std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
+std::vector<ReaderJob> parse_nonpositional_args(Context<E> &ctx);
 
 //
 // passes.cc
@@ -2110,6 +2311,7 @@ template <typename E> void create_internal_file(Context<E> &);
 template <typename E> void apply_exclude_libs(Context<E> &);
 template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
+template <typename E> void gather_symbols(Context<E> &);
 template <typename E> void resolve_symbols(Context<E> &);
 template <typename E> void do_lto(Context<E> &);
 template <typename E> void parse_eh_frame_sections(Context<E> &);
@@ -2123,6 +2325,7 @@ template <typename E> void check_cet_errors(Context<E> &);
 template <typename E> void print_dependencies(Context<E> &);
 template <typename E> void write_repro_file(Context<E> &);
 template <typename E> void check_duplicate_symbols(Context<E> &);
+template <typename E> void check_symbol_version_conflicts(Context<E> &);
 template <typename E> void convert_zero_to_bss(Context<E> &);
 template <typename E> void check_shlib_undefined(Context<E> &);
 template <typename E> void check_symbol_types(Context<E> &);
@@ -2235,7 +2438,9 @@ public:
   }
 
   void add_symbol(Context<PPC64V1> &ctx, Symbol<PPC64V1> *sym);
-  std::vector<ElfRel<PPC64V1>> collect_dynrels(Context<PPC64V1> &ctx) const override;
+  i64 get_num_dynrels(Context<PPC64V1> &ctx) const override;
+  std::vector<u64> get_relr_offsets(Context<PPC64V1> &ctx) override;
+  void write_dynrels(Context<PPC64V1> &ctx, ElfRel<PPC64V1> *buf) const override;
   void copy_buf(Context<PPC64V1> &ctx) override;
 
   static constexpr i64 ENTRY_SIZE = sizeof(Word<PPC64V1>) * 3;
@@ -2390,7 +2595,9 @@ struct ContextExtras<SPARC64> {
 // resource management, and other miscellaneous objects.
 template <typename E>
 struct Context {
-  Context() {
+  Context() : symbol_map(arena) {
+    discarded_comdat_sym<E> = arena.template make<Symbol<E>>();
+
     arg.entry = get_symbol(*this, "_start");
     arg.fini = get_symbol(*this, "_fini");
     arg.init = get_symbol(*this, "_init");
@@ -2430,7 +2637,7 @@ struct Context {
     bool demangle = true;
     bool detach = true;
     bool discard_all = false;
-    bool discard_locals = false;
+    bool discard_locals = true;
     bool dynamic_list_data = false;
     bool eh_frame_hdr = true;
     bool emit_relocs = false;
@@ -2556,15 +2763,26 @@ struct Context {
   // Reader context
   i64 file_priority = 10000;
 
-  // Symbol table
-  tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
-  tbb::concurrent_hash_map<std::string_view, ComdatGroup, HashCmp> comdat_groups;
-  tbb::concurrent_vector<std::unique_ptr<MergedSection<E>>> merged_sections;
+  // Input files with their command line positions, in the
+  // nondeterministic order in which the parallel file reader found
+  // them. read_input_files() sorts them by position to construct
+  // `objs` and `dsos`.
+  tbb::concurrent_vector<std::pair<std::vector<u32>, InputFile<E> *>> unsorted_input_files;
+
+  // Symbol table. Object file parsing records each global symbol with add(),
+  // together with the file's slot for the resulting Symbol pointer.
+  // gather_symbols() gathers them. Other symbols, such as linker-synthesized
+  // ones and shared library symbols, are interned directly through insert() in
+  // get_symbol().
+  ArenaResource arena;
+  ShardedMap<Symbol<E>> symbol_map;
+
+  tbb::concurrent_vector<ArenaObjectPtr<MergedSection<E>>> merged_sections;
 
   tbb::concurrent_vector<std::unique_ptr<TimerRecord>> timer_records;
 
-  tbb::concurrent_vector<std::unique_ptr<ObjectFile<E>>> obj_pool;
-  tbb::concurrent_vector<std::unique_ptr<SharedFile<E>>> dso_pool;
+  tbb::concurrent_vector<ArenaObjectPtr<ObjectFile<E>>> obj_pool;
+  tbb::concurrent_vector<ArenaObjectPtr<SharedFile<E>>> dso_pool;
   tbb::concurrent_vector<std::unique_ptr<u8[]>> string_pool;
   tbb::concurrent_vector<std::unique_ptr<MappedFile>> mf_pool;
   tbb::concurrent_vector<std::unique_ptr<Chunk<E>>> chunk_pool;
@@ -2637,6 +2855,8 @@ struct Context {
   MergedSection<E> *comment = nullptr;
 
   // For --gdb-index
+  // shared_ptr lets the implementation type remain in gdb-index.cc.
+  std::shared_ptr<GdbIndexData> gdb_index_data;
   std::span<u8> debug_info;
   std::span<u8> debug_abbrev;
   std::span<u8> debug_ranges;
@@ -2705,12 +2925,11 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file);
 enum {
   NEEDS_GOT       = 1 << 0,
   NEEDS_PLT       = 1 << 1,
-  NEEDS_CPLT      = 1 << 2,
+  NEEDS_CANONICAL = 1 << 2, // canonical PLT or copy relocation
   NEEDS_GOTTP     = 1 << 3,
   NEEDS_TLSGD     = 1 << 4,
-  NEEDS_COPYREL   = 1 << 5,
-  NEEDS_TLSDESC   = 1 << 6,
-  NEEDS_PPC_OPD   = 1 << 7, // for PPCv1
+  NEEDS_TLSDESC   = 1 << 5,
+  NEEDS_PPC_OPD   = 1 << 6, // for PPCv1
 };
 
 // Flags for Symbol<E>::get_addr()
@@ -2729,11 +2948,8 @@ template <typename E>
 class Symbol {
 public:
   Symbol() = default;
-
-  Symbol(std::string_view name, bool demangle)
-    : nameptr(name.data()), namelen(name.size()), demangle(demangle) {}
-
-  Symbol(const Symbol<E> &other) : Symbol(other.name(), other.demangle) {}
+  Symbol(const Symbol &) = delete;
+  Symbol &operator=(const Symbol &) = delete;
 
   u64 get_addr(Context<E> &ctx, i64 flags = 0) const;
   u64 get_got_addr(Context<E> &ctx) const;
@@ -2790,10 +3006,12 @@ public:
   InputSection<E> *get_input_section() const;
   Chunk<E> *get_output_section() const;
   SectionFragment<E> *get_frag() const;
+  Symbol<E> *get_symbol_origin() const;
 
   void set_input_section(InputSection<E> *);
   void set_output_section(Chunk<E> *);
   void set_frag(SectionFragment<E> *);
+  void set_symbol_origin(Symbol<E> *);
 
   void set_name(std::string_view);
   std::string_view name() const;
@@ -2807,38 +3025,16 @@ public:
   // A symbol is owned by a file. If two or more files define the
   // same symbol, the one with the strongest definition owns the symbol.
   // If `file` is null, the symbol is not defined by any input file.
-  InputFile<E> *file = nullptr;
+  // A symbol usually belongs to an input section, but it can belong to a
+  // section fragment, an output section or nothing (i.e. an absolute symbol).
+  // A symbol pointer is used temporarily for default symbol versions.
+  TaggedPtr<InputSection<E>, Chunk<E>, SectionFragment<E>, Symbol<E>> origin;
 
-  // A symbol usually belongs to an input section, but it can belong
-  // to a section fragment, an output section or nothing
-  // (i.e. absolute symbol). `origin` holds one of them. We use the
-  // least significant two bits to distinguish type.
-  enum : uintptr_t {
-    TAG_ABS  = 0b00,
-    TAG_ISEC = 0b01,
-    TAG_OSEC = 0b10,
-    TAG_FRAG = 0b11,
-    TAG_MASK = 0b11,
-  };
-
-  // We want to make sure there are enough number of unused bits in
-  // pointers referring to these structures. In particular, we need
-  // __attribute__((aligned(4))) for m68k on which int, long, float
-  // and double are aligned only to two byte boundaries.
-  static_assert(alignof(InputSection<E>) >= 4);
-  static_assert(alignof(Chunk<E>) >= 4);
-  static_assert(alignof(SectionFragment<E>) >= 4);
-
-  uintptr_t origin = 0;
-
-  // `value` contains symbol value. If it's an absolute symbol, it is
-  // equivalent to its address. If it belongs to an input section or a
-  // section fragment, value is added to the base of the input section
-  // to yield an address.
+  // `value` contains the symbol value. If this is an absolute symbol, it is
+  // equivalent to its address. Otherwise, it is relative to `origin`.
   u64 value = 0;
 
-  const char *nameptr = nullptr;
-  i32 namelen = 0;
+  ArenaPtr<InputFile<E>> file = nullptr;
 
   // Index into the symbol table of the owner file.
   i32 sym_idx = -1;
@@ -2854,11 +3050,6 @@ public:
 
   bool is_weak : 1 = false;
   bool write_to_symtab : 1 = false; // for --strip-all and the like
-  bool is_traced : 1 = false;       // for --trace-symbol
-  bool is_wrapped : 1 = false;      // for --wrap
-
-  // For symbols with default symbol version, e.g. foo@@VERSION.
-  bool is_versioned_default : 1 = false;
 
   // If a symbol can be resolved to a symbol in a different ELF file at
   // runtime, `is_imported` is true. If a symbol is a dynamic symbol and
@@ -2963,6 +3154,16 @@ public:
   // will become read-only at run-time.
   bool has_copyrel : 1 = false;
   bool is_copyrel_readonly : 1 = false;
+  bool demangle : 1 = false;
+
+  // Global symbols are stored next to their names in the symbol map.
+  bool has_map_name : 1 = false;
+
+  bool is_traced : 1 = false;       // for --trace-symbol
+  bool is_wrapped : 1 = false;      // for --wrap
+
+  // For symbols with default symbol version, e.g. foo@@VERSION.
+  bool is_versioned_default : 1 = false;
 
   // For symbol resolution. This flag is used rarely. See a comment in
   // resolve_symbols().
@@ -2975,8 +3176,11 @@ public:
   // opposed to IR object).
   bool referenced_by_regular_obj : 1 = false;
 
-  // If true, we try to dmenagle the sybmol when printing.
-  bool demangle : 1 = false;
+  // A dummy symbol created for a relocation into a mergeable fragment.
+  bool is_fragment_dummy : 1 = false;
+
+  // The name bytes live in the surrounding map entry or the owner file.
+  NameLen namelen;
 };
 
 template <typename E>
@@ -2985,9 +3189,6 @@ Symbol<E> *get_symbol(Context<E> &ctx, std::string_view key,
 
 template <typename E>
 Symbol<E> *get_symbol(Context<E> &ctx, std::string_view name);
-
-template <typename E>
-ComdatGroup *insert_comdat_group(Context<E> &ctx, std::string_view name);
 
 template <typename E>
 std::string_view demangle(const Symbol<E> &sym);
@@ -3002,7 +3203,7 @@ std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym);
 template <typename E>
 inline std::ostream &
 operator<<(std::ostream &out, const InputSection<E> &isec) {
-  out << isec.file << ":(" << isec.name << ")";
+  out << isec.file << ":(" << isec.name() << ")";
   return out;
 }
 
@@ -3033,7 +3234,7 @@ inline i64 get_addend(u8 *loc, const ElfRel<E> &rel) {
 
 template <typename E>
 i64 get_addend(InputSection<E> &isec, const ElfRel<E> &rel) {
-  return get_addend((u8 *)isec.contents.data() + rel.r_offset, rel);
+  return get_addend(isec.contents + rel.r_offset, rel);
 }
 
 template <typename E>
@@ -3050,13 +3251,118 @@ inline ElfShdr<E> &InputSection<E>::shdr() const {
 }
 
 template <typename E>
+inline std::string_view InputSection<E>::get_contents() const {
+  if (!contents)
+    return {};
+  i64 size = shdr().sh_size;
+  if ((shdr().sh_flags & SHF_COMPRESSED) && uncompressed)
+    size = sh_size;
+  return {(char *)contents, (size_t)size};
+}
+
+template <typename E>
+inline std::string_view InputSection<E>::name() const {
+  if (shndx >= file.elf_sections.size())
+    return (shdr().sh_flags & SHF_TLS) ? ".tls_common" : ".common";
+
+  const char *data =
+    file.shstrtab.data() + file.elf_sections[shndx].sh_name;
+  if (namelen == UINT16_MAX)
+    return {data, UINT16_MAX + strlen(data + UINT16_MAX)};
+  return {data, namelen};
+}
+
+// Decode CREL entries one at a time so callers can either stream them or
+// materialize them in an array.
+template <typename E>
+class CrelReader {
+public:
+  CrelReader(Context<E> &ctx, ObjectFile<E> &file, const ElfShdr<E> &shdr) {
+    u8 *p = (u8 *)file.get_string(ctx, shdr).data();
+    u64 hdr = read_uleb(&p);
+    data = p;
+    nrels = hdr >> 3;
+    is_rela = hdr & 0b100;
+    scale = hdr & 0b11;
+
+    if (is_rela && !E::is_rela)
+      Fatal(ctx) << file << ": CREL with addends is not supported for " << E::name;
+  }
+
+  i64 size() const {
+    return nrels;
+  }
+
+  void for_each(auto fn) const {
+    u8 *p = data;
+    i64 nflags = is_rela ? 3 : 2;
+    u64 offset = 0;
+    i64 type = 0;
+    i64 symidx = 0;
+    i64 addend = 0;
+
+    for (i64 i = 0; i < nrels; i++) {
+      u8 flags = *p++;
+
+      // The first byte combines flags with the low bits of an offset delta.
+      // A large delta continues as ULEB128 and can wrap the current offset.
+      u64 delta;
+      if (flags & 0x80)
+        delta = (read_uleb(&p) << (7 - nflags)) |
+                ((flags & 0x7f) >> nflags);
+      else
+        delta = flags >> nflags;
+      offset += delta << scale;
+
+      if (flags & 1)
+        symidx += read_sleb(&p);
+      if (flags & 2)
+        type += read_sleb(&p);
+      if (is_rela && (flags & 4))
+        addend += read_sleb(&p);
+
+      ElfRel<E> rel(offset, type, symidx, addend);
+      fn(rel, i);
+    }
+  }
+
+private:
+  u8 *data;
+  i64 nrels;
+  i64 scale;
+  bool is_rela;
+};
+
+template <typename E>
+inline void InputSection<E>::for_each_reloc(Context<E> &ctx, auto fn) const {
+  ObjectFile<E> &file = this->file;
+
+  if (relsec_idx != -1) {
+    ElfShdr<E> &shdr = file.elf_sections[relsec_idx];
+    if (shdr.sh_type == SHT_CREL &&
+        !file.decoded_crel[relsec_idx].data()) {
+      CrelReader<E>(ctx, file, shdr).for_each(fn);
+      return;
+    }
+  }
+
+  std::span<const ElfRel<E>> rels = get_rels(ctx);
+  for (i64 i = 0; i < rels.size(); i++)
+    fn(rels[i], i);
+}
+
+template <typename E>
 inline std::span<ElfRel<E>> InputSection<E>::get_rels(Context<E> &ctx) const {
   if (relsec_idx == -1)
     return {};
 
   ElfShdr<E> &shdr = file.elf_sections[relsec_idx];
-  if (shdr.sh_type == SHT_CREL)
-    return file.decoded_crel[relsec_idx];
+  if (shdr.sh_type == SHT_CREL) {
+    ExactArray<ElfRel<E>> &rels = file.decoded_crel[relsec_idx];
+    if (!rels.data())
+      rels = decode_crel(ctx, file, shdr);
+    return std::span<ElfRel<E>>(rels.data(), rels.size());
+  }
   return file.template get_data<ElfRel<E>>(ctx, shdr);
 }
 
@@ -3078,7 +3384,7 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
     return {nullptr, 0};
 
   i64 shndx = file.get_shndx(esym);
-  std::unique_ptr<MergeableSection<E>> &m = file.mergeable_sections[shndx];
+  MergeableSection<E> *m = file.sections.get_mergeable(shndx);
   if (!m)
     return {nullptr, 0};
 
@@ -3106,18 +3412,20 @@ InputSection<E>::get_tombstone(Symbol<E> &sym, SectionFragment<E> *frag) {
     return {};
 
   InputSection<E> *isec = sym.get_input_section();
+  bool discarded = (&sym == discarded_comdat_sym<E>);
 
   // Setting a tombstone is a special feature for a dead debug section.
-  if (!isec || isec->is_alive)
+  if ((!isec && !discarded) || (isec && isec->is_alive))
     return {};
 
+  std::string_view name = this->name();
   if (!name.starts_with(".debug_"))
     return {};
 
   // If the section was dead due to ICF, we don't want to emit debug
   // info for that section but want to set real values to .debug_line so
   // that users can set a breakpoint inside a merged section.
-  if (isec->icf_removed() && name == ".debug_line")
+  if (isec && isec->icf_removed() && name == ".debug_line")
     return {};
 
   // 0 is an invalid value in most debug info sections, so we use it
@@ -3154,9 +3462,26 @@ MergeableSection<E>::get_fragment(i64 offset) {
 template <typename E>
 std::string_view MergeableSection<E>::get_contents(i64 i) {
   i64 cur = frag_offsets[i];
+  std::string_view contents = input_section->get_contents();
   if (i == frag_offsets.size() - 1)
-    return input_section->contents.substr(cur);
-  return input_section->contents.substr(cur, frag_offsets[i + 1] - cur);
+    return contents.substr(cur);
+  return contents.substr(cur, frag_offsets[i + 1] - cur);
+}
+
+template <typename E>
+std::span<U32<E>>
+ComdatGroupRef<E>::members(ObjectFile<E> &file) const {
+  const ElfShdr<E> &shdr = file.elf_sections[sect_idx];
+  std::span<U32<E>> entries(
+    (U32<E> *)(file.mf->data + shdr.sh_offset),
+    (i64)(shdr.sh_size / sizeof(U32<E>)));
+  assert(!entries.empty());
+  return entries.subspan(1);
+}
+
+template <typename E>
+Symbol<E> *ComdatGroupRef<E>::signature(Context<E> &ctx) const {
+  return ctx.arena.template get_pointer<Symbol<E>>(signature_arena_idx);
 }
 
 template <typename E>
@@ -3195,13 +3520,27 @@ inline std::string_view InputFile<E>::get_string(Context<E> &ctx, i64 idx) {
 }
 
 template <typename E>
-inline std::span<Symbol<E> *> InputFile<E>::get_local_syms() {
-  return std::span<Symbol<E> *>(this->symbols).subspan(0, this->first_global);
+inline std::span<ArenaPtr<Symbol<E>>> InputFile<E>::get_local_syms() {
+  return std::span<ArenaPtr<Symbol<E>>>(this->symbols)
+    .subspan(0, this->first_global);
 }
 
 template <typename E>
-inline std::span<Symbol<E> *> InputFile<E>::get_global_syms() {
-  return std::span<Symbol<E> *>(this->symbols).subspan(this->first_global);
+inline std::span<ArenaPtr<Symbol<E>>> InputFile<E>::get_global_syms() {
+  return std::span<ArenaPtr<Symbol<E>>>(this->symbols)
+    .subspan(this->first_global);
+}
+
+template <typename E>
+inline ObjectFile<E> *InputFile<E>::to_obj() {
+  assert(!is_dso);
+  return static_cast<ObjectFile<E> *>(this);
+}
+
+template <typename E>
+inline SharedFile<E> *InputFile<E>::to_dso() {
+  assert(is_dso);
+  return static_cast<SharedFile<E> *>(this);
 }
 
 template <typename E>
@@ -3217,8 +3556,56 @@ inline i64 ObjectFile<E>::get_shndx(const ElfSym<E> &esym) {
 }
 
 template <typename E>
+inline InputSection<E> *InputSectionTable<E>::operator[](i64 idx) {
+  u32 value = indices[idx];
+  if (value == 0 || (value & MERGEABLE))
+    return nullptr;
+
+  return &pool[value - 1];
+}
+
+template <typename E>
+inline MergeableSection<E> *
+InputSectionTable<E>::get_mergeable(i64 idx) {
+  u32 value = indices[idx];
+  if (!(value & MERGEABLE))
+    return nullptr;
+  return mergeable_pool[(value & INDEX_MASK) - 1].get();
+}
+
+template <typename E>
+InputSection<E> *InputSectionTable<E>::emplace(Context<E> &ctx,
+                                               ObjectFile<E> &file,
+                                               i64 shndx,
+                                               std::string_view name) {
+  assert(0 <= shndx && shndx <= (i64)indices.size());
+  if (shndx == (i64)indices.size())
+    indices.push_back(0);
+
+  assert((u64)pool.size() + 1 < MERGEABLE);
+  InputSection<E> *isec = &pool.emplace_back(ctx, file, shndx, name);
+  indices[shndx] = pool.size();
+  return isec;
+}
+
+template <typename E>
+void InputSectionTable<E>::set_mergeable(
+    i64 idx, std::unique_ptr<MergeableSection<E>> m) {
+  assert(mergeable_pool.size() < MERGEABLE - 1);
+  mergeable_pool.push_back(std::move(m));
+  indices[idx] = MERGEABLE | mergeable_pool.size();
+}
+
+template <typename E>
 inline InputSection<E> *ObjectFile<E>::get_section(const ElfSym<E> &esym) {
-  return sections[get_shndx(esym)].get();
+  return sections[get_shndx(esym)];
+}
+
+template <typename E>
+inline bool ObjectFile<E>::is_discarded_comdat(const ElfSym<E> &esym) {
+  if (comdat_discarded.empty() || esym.is_abs() || esym.is_common())
+    return false;
+  return comdat_discarded[get_shndx(esym)];
 }
 
 template <typename E>
@@ -3258,7 +3645,7 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
     if (isec->icf_removed())
       return isec->leader->get_addr() + value;
 
-    if (isec->name == ".eh_frame") {
+    if (isec->name() == ".eh_frame") {
       // .eh_frame contents are parsed and reconstructed by the linker,
       // so pointing to a specific location in a source .eh_frame
       // section doesn't make much sense. However, CRT files contain
@@ -3516,6 +3903,7 @@ Symbol<E>::get_thunk_addr(Context<E> &ctx, u64 P) const requires needs_thunk<E> 
         -branch_distance<E> <= disp && disp < branch_distance<E>)
       return *it;
   Fatal(ctx) << "range extension thunk out of range: " << *this;
+  unreachable();
 }
 
 template <typename E>
@@ -3534,11 +3922,16 @@ inline bool Symbol<E>::is_absolute() const {
          !get_output_section();
 }
 
+// Returns true if the symbol should be emitted as a local symbol in the
+// output symbol table. Note that a symbol that is merely not exported to
+// the dynamic symbol table is still a global symbol; only ones hidden by
+// symbol visibility or localized by a version script are demoted.
 template <typename E>
 inline bool Symbol<E>::is_local(Context<E> &ctx) const {
   if (ctx.arg.relocatable)
     return esym().st_bind == STB_LOCAL;
-  return !is_imported && !is_exported;
+  return visibility == STV_HIDDEN || visibility == STV_INTERNAL ||
+         ver_idx == VER_NDX_LOCAL;
 }
 
 template <typename E>
@@ -3580,44 +3973,43 @@ inline bool Symbol<E>::is_tprel_runtime_const(Context<E> &ctx) const {
 
 template <typename E>
 inline InputSection<E> *Symbol<E>::get_input_section() const {
-  if ((origin & TAG_MASK) == TAG_ISEC)
-    return (InputSection<E> *)(origin & ~TAG_MASK);
-  return nullptr;
+  return origin.template get<InputSection<E>>();
 }
 
 template <typename E>
 inline Chunk<E> *Symbol<E>::get_output_section() const {
-  if ((origin & TAG_MASK) == TAG_OSEC)
-    return (Chunk<E> *)(origin & ~TAG_MASK);
-  return nullptr;
+  return origin.template get<Chunk<E>>();
 }
 
 template <typename E>
 inline SectionFragment<E> *Symbol<E>::get_frag() const {
-  if ((origin & TAG_MASK) == TAG_FRAG)
-    return (SectionFragment<E> *)(origin & ~TAG_MASK);
-  return nullptr;
+  return origin.template get<SectionFragment<E>>();
 }
 
 template <typename E>
 inline void Symbol<E>::set_input_section(InputSection<E> *isec) {
-  uintptr_t addr = (uintptr_t)isec;
-  assert((addr & TAG_MASK) == 0);
-  origin = addr | TAG_ISEC;
+  origin = isec;
 }
 
 template <typename E>
 inline void Symbol<E>::set_output_section(Chunk<E> *osec) {
-  uintptr_t addr = (uintptr_t)osec;
-  assert((addr & TAG_MASK) == 0);
-  origin = addr | TAG_OSEC;
+  origin = osec;
 }
 
 template <typename E>
 inline void Symbol<E>::set_frag(SectionFragment<E> *frag) {
-  uintptr_t addr = (uintptr_t)frag;
-  assert((addr & TAG_MASK) == 0);
-  origin = addr | TAG_FRAG;
+  origin = frag;
+}
+
+template <typename E>
+inline Symbol<E> *Symbol<E>::get_symbol_origin() const {
+  return origin.template get<Symbol<E>>();
+}
+
+template <typename E>
+inline void Symbol<E>::set_symbol_origin(Symbol<E> *sym) {
+  assert(sym->has_map_name);
+  origin = sym;
 }
 
 template <typename E>
@@ -3630,7 +4022,7 @@ inline u32 Symbol<E>::get_type() const {
 template <typename E>
 inline std::string_view Symbol<E>::get_version() const {
   if (file->is_dso) {
-    std::span<std::string_view> vers = ((SharedFile<E> *)file)->version_strings;
+    std::span<std::string_view> vers = file->to_dso()->version_strings;
     if (!vers.empty())
       return vers[ver_idx];
   }
@@ -3648,18 +4040,43 @@ inline i64 Symbol<E>::get_output_sym_idx(Context<E> &ctx) const {
 
 template <typename E>
 inline const ElfSym<E> &Symbol<E>::esym() const {
+  static const ElfSym<E> empty = {};
+  if (this == discarded_comdat_sym<E>)
+    return empty;
   return file->elf_syms[sym_idx];
 }
 
 template <typename E>
 inline void Symbol<E>::set_name(std::string_view name) {
-  nameptr = name.data();
   namelen = name.size();
 }
 
 template <typename E>
 inline std::string_view Symbol<E>::name() const {
-  return {nameptr, (size_t)namelen};
+  if (has_map_name) {
+    std::string_view key = get_sharded_map_key(*this);
+    if (namelen.is_long())
+      return key.substr(0, key.find('@', namelen.lower_bound()));
+    return key.substr(0, namelen.lower_bound());
+  }
+
+  if (is_fragment_dummy)
+    return "<fragment>";
+  if (!file || sym_idx < 0)
+    return "";
+
+  const ElfSym<E> &esym = file->elf_syms[sym_idx];
+  const char *nameptr;
+
+  if (esym.st_type == STT_SECTION) {
+    ObjectFile<E> &obj = *file->to_obj();
+    i64 shndx = obj.get_shndx(esym);
+    nameptr = file->shstrtab.data() + file->elf_sections[shndx].sh_name;
+  } else {
+    nameptr = file->symbol_strtab.data() + esym.st_name;
+  }
+
+  return namelen.get_string(nameptr);
 }
 
 template <typename E>

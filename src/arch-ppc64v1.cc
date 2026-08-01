@@ -285,12 +285,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
-  std::span<const ElfRel<E>> rels = get_rels(ctx);
-
-  for (i64 i = 0; i < rels.size(); i++) {
-    const ElfRel<E> &rel = rels[i];
+  for_each_reloc(ctx, [&](const ElfRel<E> &rel, i64 i) ALWAYS_INLINE {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
-      continue;
+      return;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
@@ -324,7 +321,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
                  << rel;
     }
-  }
+  });
 }
 
 template <>
@@ -485,9 +482,9 @@ void Thunk<E>::copy_buf(Context<E> &ctx) {
 }
 
 static InputSection<E> *get_opd_section(ObjectFile<E> &file) {
-  for (std::unique_ptr<InputSection<E>> &isec : file.sections)
-    if (isec && isec->name == ".opd")
-      return isec.get();
+  for (InputSection<E> *isec : file.sections)
+    if (isec && isec->name() == ".opd")
+      return isec;
   return nullptr;
 }
 
@@ -594,8 +591,8 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
     ranges::stable_sort(opd_syms, {}, &OpdSymbol::r_offset);
 
     // Rewrite relocations so that they directly refer to .opd.
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
-      if (!isec || !isec->is_alive || isec.get() == opd)
+    for (InputSection<E> *isec : file->sections) {
+      if (!isec || !isec->is_alive || isec == opd)
         continue;
 
       for (ElfRel<E> &r : isec->get_rels(ctx)) {
@@ -619,11 +616,10 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
 // refers to the function's .opd entry. This function marks such symbols
 // with NEEDS_PPC_OPD.
 void ppc64v1_scan_symbols(Context<E> &ctx) {
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (Symbol<E> *sym : file->symbols)
-      if (sym->file == file && sym->is_exported)
-        if (u32 ty = sym->get_type(); ty == STT_FUNC || ty == STT_GNU_IFUNC)
-          sym->flags |= NEEDS_PPC_OPD;
+  ctx.symbol_map.parallel_for_each([](Symbol<E> &sym) {
+    if (sym.file && !sym.file->is_dso && sym.is_exported)
+      if (u32 ty = sym.get_type(); ty == STT_FUNC || ty == STT_GNU_IFUNC)
+        sym.flags |= NEEDS_PPC_OPD;
   });
 
   // Functions referenced by the ELF header also have to have .opd entries.
@@ -643,18 +639,35 @@ void PPC64OpdSection::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   this->shdr.sh_size += ENTRY_SIZE;
 }
 
-std::vector<ElfRel<E>> PPC64OpdSection::collect_dynrels(Context<E> &ctx) const {
+i64 PPC64OpdSection::get_num_dynrels(Context<E> &ctx) const {
+  return ctx.arg.pic ? symbols.size() * 2 : 0;
+}
+
+std::vector<u64> PPC64OpdSection::get_relr_offsets(Context<E> &ctx) {
   if (!ctx.arg.pic)
     return {};
 
-  std::vector<ElfRel<E>> rels;
+  std::vector<u64> offsets;
+  offsets.reserve(symbols.size() * 2);
+  for (Symbol<E> *sym : symbols) {
+    u64 loc = sym->get_opd_addr(ctx);
+    offsets.push_back(loc);
+    offsets.push_back(loc + 8);
+  }
+  return offsets;
+}
+
+void PPC64OpdSection::write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const {
+  if (!ctx.arg.pic)
+    return;
 
   for (Symbol<E> *sym : symbols) {
     u64 loc = sym->get_opd_addr(ctx);
-    rels.emplace_back(loc, E::R_RELATIVE, 0, sym->get_addr(ctx, NO_PLT | NO_OPD));
-    rels.emplace_back(loc + 8, E::R_RELATIVE, 0, ctx.extra.TOC->value);
+    if (!ctx.arg.pack_dyn_relocs_relr || loc % sizeof(Word<E>) != 0)
+      *buf++ = ElfRel<E>(loc, E::R_RELATIVE, 0, sym->get_addr(ctx, NO_PLT | NO_OPD));
+    if (!ctx.arg.pack_dyn_relocs_relr || (loc + 8) % sizeof(Word<E>) != 0)
+      *buf++ = ElfRel<E>(loc + 8, E::R_RELATIVE, 0, ctx.extra.TOC->value);
   }
-  return rels;
 }
 
 void PPC64OpdSection::copy_buf(Context<E> &ctx) {

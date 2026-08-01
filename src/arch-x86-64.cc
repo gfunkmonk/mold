@@ -659,12 +659,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 // scan_relocations.
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
-  std::span<const ElfRel<E>> rels = get_rels(ctx);
-
-  for (i64 i = 0; i < rels.size(); i++) {
-    const ElfRel<E> &rel = rels[i];
+  for_each_reloc(ctx, [&](const ElfRel<E> &rel, i64 i) ALWAYS_INLINE {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
-      continue;
+      return;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
@@ -743,7 +740,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
                  << rel;
       break;
     }
-  }
+  });
 }
 
 // Linker has to create data structures in an output file to apply
@@ -763,7 +760,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-    u8 *loc = (u8 *)(contents.data() + rel.r_offset);
+    u8 *loc = contents + rel.r_offset;
 
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
@@ -909,10 +906,14 @@ void rewrite_endbr(Context<E> &ctx) {
     // If isec has an endbr64 at a given offset, copy that instruction to
     // the output buffer, possibly overwriting a nop written in the above
     // loop.
+    i64 size = 0;
+    if (isec)
+      size = isec->get_contents().size();
+
     if (isec && isec->output_section &&
         (isec->shdr().sh_flags & SHF_EXECINSTR) &&
-        0 <= offset && offset <= isec->contents.size() - 4 &&
-        memcmp(isec->contents.data() + offset, endbr64, 4) == 0)
+        0 <= offset && offset <= size - 4 &&
+        memcmp(isec->contents + offset, endbr64, 4) == 0)
       memcpy(ctx.buf + isec->output_section->shdr.sh_offset + isec->offset + offset,
              endbr64, 4);
   };
@@ -920,7 +921,7 @@ void rewrite_endbr(Context<E> &ctx) {
   // Write back endbr64 instructions if they are referred to by address-taking
   // relocations.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
+    for (InputSection<E> *isec : file->sections) {
       if (isec && isec->is_alive && (isec->shdr().sh_flags & SHF_ALLOC)) {
         for (const ElfRel<E> &rel : isec->get_rels(ctx)) {
           if (!is_func_call_rel(rel)) {

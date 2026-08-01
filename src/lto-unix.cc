@@ -179,13 +179,17 @@ static PluginStatus add_input_file(const char *path) {
   MappedFile *mf = must_open_file(ctx, path);
   mf->is_dependency = false;
 
-  ObjectFile<E> *file = new ObjectFile<E>(ctx, mf, "");
+  ObjectFile<E> *file = ctx.arena.template make<ObjectFile<E>>(ctx, mf, "");
   ctx.obj_pool.emplace_back(file);
   lto_objects<E>.push_back(file);
 
   file->priority = file_priority++;
   file->is_reachable = true;
-  file->parse(ctx);
+  file->parse_symbols(ctx);
+
+  // parse_symbols() only registers global symbols. Create their shared
+  // Symbol objects and fill in the file's pointers before resolving.
+  gather_symbols(ctx);
   file->resolve_symbols(ctx);
   return LDPS_OK;
 }
@@ -307,7 +311,7 @@ get_symbols(const void *handle, int nsyms, PluginSymbol *psyms, bool is_v2) {
     if (sym.file->is_dso)
       return LDPR_RESOLVED_DYN;
 
-    if (((ObjectFile<E> *)sym.file)->is_lto_obj && !sym.is_wrapped)
+    if (sym.file->to_obj()->is_lto_obj && !sym.is_wrapped)
       return esym.is_undef() ? LDPR_RESOLVED_IR : LDPR_PREEMPTED_IR;
     return esym.is_undef() ? LDPR_RESOLVED_EXEC : LDPR_PREEMPTED_REG;
   };
@@ -342,7 +346,7 @@ static void restart_process(Context<E> &ctx) {
   for (std::string_view arg : ctx.cmdline_args)
     args.push_back(strdup(std::string(arg).c_str()));
 
-  for (std::unique_ptr<ObjectFile<E>> &file : ctx.obj_pool)
+  for (ArenaObjectPtr<ObjectFile<E>> &file : ctx.obj_pool)
     if (file->is_lto_obj && !file->is_reachable)
       args.push_back(strdup(("--:ignore-ir-file=" +
                              file->mf->get_identifier()).c_str()));
@@ -603,18 +607,23 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile *mf) {
 
   load_lto_plugin(ctx);
 
-  // V0 API's claim_file is not thread-safe.
+  // We read input files in parallel, but the plugin interface is not
+  // ready for concurrent claims: claim_file_hook() returns a file's
+  // symbol table through the add_symbols() callback into a global
+  // buffer, and members of the same archive share their parent's file
+  // descriptor, which we close after each claim. Serialize the whole
+  // claim sequence.
   static std::mutex mu;
-  std::unique_lock lock(mu, std::defer_lock);
-  if (!is_gcc_linker_api_v1)
-    lock.lock();
+  std::scoped_lock lock(mu);
 
   // Create mold's object instance
-  ObjectFile<E> *obj = new ObjectFile<E>;
+  ObjectFile<E> *obj =
+    ctx.arena.template make<ObjectFile<E>>(ctx);
   ctx.obj_pool.emplace_back(obj);
 
   obj->filename = mf->name;
-  obj->symbols.push_back(new Symbol<E>);
+  Symbol<E> *dummy = ctx.arena.template make<Symbol<E>>();
+  obj->symbols.emplace_back(dummy);
   obj->first_global = 1;
   obj->is_lto_obj = true;
   obj->mf = mf;
@@ -651,7 +660,8 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile *mf) {
 
   // Initialize esyms
   obj->lto_elf_syms.resize(plugin_symbols.size() + 1);
-  obj->lto_comdat_groups.resize(plugin_symbols.size() + 1);
+  obj->lto_comdat_signatures.resize(plugin_symbols.size() + 1);
+  obj->lto_comdat_discarded.resize(plugin_symbols.size() + 1);
   i64 strtab_offset = 1;
 
   for (i64 i = 0; i < plugin_symbols.size(); i++) {
@@ -669,14 +679,14 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile *mf) {
     // have input sections.
     if (psym.comdat_key) {
       std::string_view key = save_string(ctx, psym.comdat_key);
-      obj->lto_comdat_groups[i + 1] = insert_comdat_group(ctx, key);
+      obj->lto_comdat_signatures[i + 1] = get_symbol(ctx, key);
     }
   }
 
   obj->symbol_strtab = save_string(ctx, strtab);
   obj->elf_syms = obj->lto_elf_syms;
-  obj->populate_symbol_names();
-  obj->initialize_symbols(ctx);
+  obj->populate_symbol_name_lengths();
+  obj->register_global_symbols(ctx);
   plugin_symbols.clear();
   return obj;
 }
@@ -698,7 +708,7 @@ std::vector<ObjectFile<E> *> run_lto_plugin(Context<E> &ctx) {
     if (!file->is_lto_obj) {
       for (Symbol<E> *sym : file->get_global_syms()) {
         if (sym->file && !sym->file->is_dso &&
-            ((ObjectFile<E> *)sym->file)->is_lto_obj) {
+            sym->file->to_obj()->is_lto_obj) {
           std::scoped_lock lock(sym->mu);
           sym->referenced_by_regular_obj = true;
         }

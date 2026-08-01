@@ -276,38 +276,131 @@ static void resolve_default_symver(Context<E> &ctx) {
   append(files, ctx.dsos);
 
   tbb::parallel_for_each(files, [](InputFile<E> *file) {
-    std::span<Symbol<E> *> syms = file->get_global_syms();
+    std::span<ArenaPtr<Symbol<E>>> syms = file->get_global_syms();
     for (i64 i = 0; i < syms.size(); i++)
       if (syms[i]->is_versioned_default)
-        syms[i] = (Symbol<E> *)syms[i]->origin;
+        syms[i] = syms[i]->get_symbol_origin();
   });
 }
 
 template <typename E>
 static void clear_symbols(Context<E> &ctx) {
-  std::vector<InputFile<E> *> files;
-  append(files, ctx.objs);
-  append(files, ctx.dsos);
+  ctx.symbol_map.parallel_for_each([](Symbol<E> &sym) {
+    if (sym.file) {
+      sym.file = nullptr;
+      sym.origin = nullptr;
+      sym.value = -1;
+      sym.sym_idx = -1;
+      sym.ver_idx = VER_NDX_UNSPECIFIED;
+      sym.is_weak = false;
+      sym.is_imported = false;
+      sym.is_exported = false;
+    }
+  });
+}
 
-  tbb::parallel_for_each(files, [](InputFile<E> *file) {
-    for (Symbol<E> *sym : file->get_global_syms()) {
-      if (__atomic_load_n(&sym->file, __ATOMIC_ACQUIRE) == file) {
-        sym->origin = 0;
-        sym->value = -1;
-        sym->sym_idx = -1;
-        sym->ver_idx = VER_NDX_UNSPECIFIED;
-        sym->is_weak = false;
-        sym->is_imported = false;
-        sym->is_exported = false;
-        __atomic_store_n(&sym->file, nullptr, __ATOMIC_RELEASE);
+// Creates a Symbol for each global symbol name recorded during file
+// parsing and fills in the files' symbol pointers. Each hash shard of
+// the symbol table is populated by a single thread, so no
+// synchronization is needed, unlike interning symbols directly into a
+// concurrent hash table as files are parsed.
+template <typename E>
+void gather_symbols(Context<E> &ctx) {
+  Timer t(ctx, "gather_symbols");
+
+  ctx.symbol_map.gather(
+    [&](std::string_view key, Symbol<E> &sym) {
+      sym.has_map_name = true;
+      sym.set_name(key.substr(0, key.find('@')));
+      sym.demangle = ctx.arg.demangle;
+    });
+}
+
+template <typename E>
+static void record_comdat_owner(Symbol<E> &signature, i32 priority) {
+  // Symbol resolution is clear while COMDAT groups are selected, so sym_idx
+  // can temporarily hold the winning file priority.
+  std::atomic_ref<i32> owner(signature.sym_idx);
+  i32 old = owner.load(std::memory_order_relaxed);
+  while ((old == -1 || priority < old) &&
+         !owner.compare_exchange_weak(old, priority,
+                                      std::memory_order_relaxed));
+}
+
+// Select COMDAT groups and construct input sections. If LTO will run,
+// the first invocation also constructs the losing copies of COMDAT
+// members because this function runs again after LTO and may then
+// select a different winner.
+template <typename E>
+static void parse_input_sections(Context<E> &ctx) {
+  Timer t(ctx, "parse_input_sections");
+
+  // Read COMDAT metadata and choose an owner among reachable regular objects.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (!file->is_reachable)
+      return;
+
+    if (file->mf && !file->is_lto_obj && !file->sections_parsed)
+      file->read_section_metadata(ctx);
+
+    for (ComdatGroupRef<E> &ref : file->comdat_groups)
+      record_comdat_owner(*ref.signature(ctx), file->priority);
+  });
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (file->is_reachable)
+      for (ComdatGroupRef<E> &ref : file->comdat_groups)
+        ref.is_owner = (ref.signature(ctx)->sym_idx == file->priority);
+  });
+
+  // LTO plugin symbol tables may not enumerate all section-level helper
+  // symbols (e.g. some thunks). Therefore, an IR file may claim a signature
+  // only if no reachable regular object has already claimed it.
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (file->is_reachable) {
+      for (i64 i = 0; i < file->lto_comdat_signatures.size(); i++) {
+        if (Symbol<E> *sig = file->lto_comdat_signatures[i]) {
+          if (sig->sym_idx == -1)
+            sig->sym_idx = file->priority;
+          file->lto_comdat_discarded[i] = (sig->sym_idx != file->priority);
+        }
       }
     }
+  }
+
+  // Restore sym_idx before the final symbol-resolution pass.
+  ctx.symbol_map.parallel_for_each([](Symbol<E> &sym) { sym.sym_idx = -1; });
+
+  // LTO can change archive extraction and therefore the winning COMDAT group.
+  // Construct the losing copies too so one can become the winner after LTO.
+  bool keep_discarded_comdat =
+    ranges::any_of(ctx.objs, [](ObjectFile<E> *file) {
+      return file->is_reachable &&
+             (file->is_lto_obj || file->is_gcc_offload_obj);
+    });
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (file->is_reachable && file->mf && !file->is_lto_obj &&
+        !file->sections_parsed)
+      file->parse_sections(ctx, keep_discarded_comdat);
+  });
+
+  // Apply the selection to all group members. This also updates sections
+  // parsed before LTO if ownership has changed.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    if (file->is_reachable)
+      for (ComdatGroupRef<E> &ref : file->comdat_groups)
+        for (u32 i : ref.members(*file))
+          if (InputSection<E> *isec = file->sections[i])
+            isec->is_alive = ref.is_owner;
   });
 }
 
 template <typename E>
 void resolve_symbols(Context<E> &ctx) {
   Timer t(ctx, "resolve_symbols");
+
+  gather_symbols(ctx);
 
   std::vector<InputFile<E> *> files;
   append(files, ctx.objs);
@@ -329,14 +422,11 @@ void resolve_symbols(Context<E> &ctx) {
     // symbol resolution from scratch with the flag to skip that symbol
     // next time. This should be rare.
     std::atomic_bool redo = false;
-    tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
-      if (file->is_reachable) {
-        for (Symbol<E> *sym : file->symbols) {
-          if (sym->file == file && sym->visibility == STV_HIDDEN) {
-            sym->skip_dso = true;
-            redo = true;
-          }
-        }
+    ctx.symbol_map.parallel_for_each([&](Symbol<E> &sym) {
+      if (sym.file && sym.file->is_dso && sym.file->is_reachable &&
+          sym.visibility == STV_HIDDEN) {
+        sym.skip_dso = true;
+        redo = true;
       }
     });
 
@@ -353,42 +443,10 @@ void resolve_symbols(Context<E> &ctx) {
   // To redo symbol resolution, we want to clear the state first.
   clear_symbols(ctx);
 
-  // COMDAT elimination needs to happen exactly here.
-  //
-  // It needs to be after archive extraction, otherwise we might
-  // assign COMDAT leader to an archive member that is not supposed to
-  // be extracted.
-  //
-  // It needs to happen before the final symbol resolution, otherwise
-  // we could eliminate a symbol that is already resolved to and cause
-  // dangling references.
-  tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-    if (file->is_reachable)
-      for (ComdatGroupRef<E> &ref : file->comdat_groups)
-        update_minimum(ref.group->owner, file->priority);
-  });
-
-  // LTO plugin symbol tables may not enumerate all section-level helper
-  // symbols (e.g. some thunks). If an LTO file wins COMDAT ownership for
-  // a key shared with regular object files, section elimination may discard
-  // needed regular COMDAT members and create dangling relocations.
-  //
-  // Therefore, only let IR files claim ownership for COMDAT keys that have
-  // no reachable regular-object owner.
-  for (ObjectFile<E> *file : ctx.objs)
-    if (file->is_reachable)
-      for (ComdatGroup *g : file->lto_comdat_groups)
-        if (g && g->owner == (u32)-1)
-          g->owner = file->priority;
-
-  tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-    if (file->is_reachable)
-      for (ComdatGroupRef<E> &ref : file->comdat_groups)
-        if (ref.group->owner != file->priority)
-          for (u32 i : ref.members)
-            if (InputSection<E> *isec = file->sections[i].get())
-              isec->is_alive = false;
-  });
+  // Parse input sections after archive extraction, so COMDAT selection
+  // considers only reachable objects. This must happen before final symbol
+  // resolution; otherwise discarding a group could leave a dangling reference.
+  parse_input_sections(ctx);
 
   // Redo symbol resolution
   tbb::parallel_for_each(files, [&](InputFile<E> *file) {
@@ -466,7 +524,7 @@ void create_merged_sections(Context<E> &ctx) {
   });
 
   tbb::parallel_for_each(ctx.merged_sections,
-                         [&](std::unique_ptr<MergedSection<E>> &sec) {
+                         [&](ArenaObjectPtr<MergedSection<E>> &sec) {
     if (sec->shdr.sh_flags & SHF_ALLOC)
       sec->resolve(ctx);
   });
@@ -577,6 +635,8 @@ template <typename E>
 static OutputSectionKey
 get_output_section_key(Context<E> &ctx, InputSection<E> &isec,
                        bool ctors_in_init_array) {
+  std::string_view name = isec.name();
+
   // If .init_array/.fini_array exist, .ctors/.dtors must be merged
   // with them.
   //
@@ -586,14 +646,14 @@ get_output_section_key(Context<E> &ctx, InputSection<E> &isec,
   // We do not place them into .init_array/.fini_array because such
   // invalid pointer values would simply make the program to crash.
   if (ctors_in_init_array && !isec.get_rels(ctx).empty()) {
-    if (isec.name == ".ctors" || isec.name.starts_with(".ctors."))
+    if (name == ".ctors" || name.starts_with(".ctors."))
       return {".init_array", SHT_INIT_ARRAY};
-    if (isec.name == ".dtors" || isec.name.starts_with(".dtors."))
+    if (name == ".dtors" || name.starts_with(".dtors."))
       return {".fini_array", SHT_FINI_ARRAY};
   }
 
   const ElfShdr<E> &shdr = isec.shdr();
-  std::string_view name = get_output_name(ctx, isec.name, shdr.sh_flags);
+  name = get_output_name(ctx, name, shdr.sh_flags);
   u64 type = canonicalize_type<E>(name, shdr.sh_type);
   return {name, type};
 }
@@ -645,7 +705,7 @@ void create_output_sections(Context<E> &ctx) {
     // It makes a noticeable difference if we have millions of input sections.
     MapType &cache = caches.local();
 
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
+    for (InputSection<E> *isec : file->sections) {
       if (!isec || !isec->is_alive)
         continue;
 
@@ -654,7 +714,8 @@ void create_output_sections(Context<E> &ctx) {
                      ~SHF_COMPRESSED & ~SHF_GNU_RETAIN;
 
       if (ctx.arg.relocatable && (sh_flags & SHF_GROUP)) {
-        OutputSection<E> *osec = new OutputSection<E>(isec->name, shdr.sh_type);
+        OutputSection<E> *osec =
+          new OutputSection<E>(isec->name(), shdr.sh_type);
         osec->sh_flags = sh_flags;
         isec->output_section = osec;
         ctx.osec_pool.emplace_back(osec);
@@ -701,9 +762,9 @@ void create_output_sections(Context<E> &ctx) {
     osec->members_vec.resize(ctx.objs.size());
 
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    for (std::unique_ptr<InputSection<E>> &isec : ctx.objs[i]->sections)
+    for (InputSection<E> *isec : ctx.objs[i]->sections)
       if (isec && isec->output_section)
-        isec->output_section->members_vec[i].push_back(isec.get());
+        isec->output_section->members_vec[i].push_back(isec);
   });
 
   // Compute section alignment
@@ -730,7 +791,7 @@ void create_output_sections(Context<E> &ctx) {
   std::vector<Chunk<E> *> chunks;
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.osec_pool)
     chunks.push_back(osec.get());
-  for (std::unique_ptr<MergedSection<E>> &osec : ctx.merged_sections)
+  for (ArenaObjectPtr<MergedSection<E>> &osec : ctx.merged_sections)
     chunks.push_back(osec.get());
 
   // Sections are added to the section lists in an arbitrary order
@@ -748,7 +809,8 @@ void create_output_sections(Context<E> &ctx) {
 // symbols.
 template <typename E>
 void create_internal_file(Context<E> &ctx) {
-  ObjectFile<E> *obj = new ObjectFile<E>;
+  ObjectFile<E> *obj =
+    ctx.arena.template make<ObjectFile<E>>(ctx);
   ctx.obj_pool.emplace_back(obj);
   ctx.internal_obj = obj;
   ctx.objs.push_back(obj);
@@ -756,13 +818,14 @@ void create_internal_file(Context<E> &ctx) {
   // Create linker-synthesized symbols.
   ctx.internal_esyms.resize(1);
 
-  obj->symbols.push_back(new Symbol<E>);
+  Symbol<E> *dummy = ctx.arena.template make<Symbol<E>>();
+  obj->symbols.emplace_back(dummy);
   obj->first_global = 1;
   obj->is_reachable = true;
   obj->priority = 1;
 
   auto add = [&](Symbol<E> *sym) {
-    obj->symbols.push_back(sym);
+    obj->symbols.emplace_back(sym);
 
     // An actual value will be set to a linker-synthesized symbol by
     // fix_synthetic_symbols(). Until then, `value` doesn't have a valid
@@ -833,7 +896,7 @@ void add_synthetic_symbols(Context<E> &ctx) {
 
     Symbol<E> *sym = get_symbol(ctx, name);
     sym->value = 0xdeadbeef; // unique dummy value
-    obj.symbols.push_back(sym);
+    obj.symbols.emplace_back(sym);
     return sym;
   };
 
@@ -943,9 +1006,9 @@ void add_synthetic_symbols(Context<E> &ctx) {
         esym.ppc64_local_entry = sym2->esym().ppc64_local_entry;
 
       if (sym2->is_absolute())
-        sym1->origin = 0;
+        sym1->origin = nullptr;
     } else {
-      sym1->origin = 0;
+      sym1->origin = nullptr;
     }
   }
 }
@@ -1022,7 +1085,7 @@ R"(# This is an output of the mold linker's --print-dependencies option.
   };
 
   for (ObjectFile<E> *file : ctx.objs) {
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
+    for (InputSection<E> *isec : file->sections) {
       if (!isec)
         continue;
 
@@ -1130,22 +1193,51 @@ void check_duplicate_symbols(Context<E> &ctx) {
 
       // Skip if the symbol is a deduplicated comdat symbol that is in
       // an IR file.
-      if (file->is_lto_obj)
-        if (ComdatGroup *g = file->lto_comdat_groups[i])
-          if (g->owner != file->priority)
-            continue;
+      if (file->is_lto_obj && file->lto_comdat_discarded[i])
+        continue;
 
       // Skip if one side is an LTO IR object and the other is not.
       // The LTO backend resolves conflicts between IR and regular objects
       // on its own; only IR-vs-IR duplicates need to be caught here.
       if (!sym.file->is_dso &&
-          file->is_lto_obj != ((ObjectFile<E> *)sym.file)->is_lto_obj)
+          file->is_lto_obj != sym.file->to_obj()->is_lto_obj)
         continue;
 
       Error(ctx) << "duplicate symbol: " << *file << ": " << *sym.file
                  << ": " << sym;
     }
   });
+
+  ctx.checkpoint();
+}
+
+// A default-versioned symbol `foo@@VER` can also be referred to as
+// `foo@VER`, so exporting both `foo@@VER` and `foo@VER` would produce a
+// dynamic symbol table with two definitions of the same versioned name,
+// and which one a versioned reference binds to would be up to the
+// dynamic loader. GNU ld and lld reject this; so do we.
+template <typename E>
+void check_symbol_version_conflicts(Context<E> &ctx) {
+  if (!ctx.dynsym || ctx.arg.allow_multiple_definition)
+    return;
+
+  Timer t(ctx, "check_symbol_version_conflicts");
+
+  for (i64 i = 1; i < ctx.dynsym->symbols.size(); i++) {
+    Symbol<E> *sym = ctx.dynsym->symbols[i];
+    if (sym->file->is_dso || sym->is_weak ||
+        sym->ver_idx == VER_NDX_UNSPECIFIED ||
+        !(sym->ver_idx & VERSYM_HIDDEN))
+      continue;
+
+    Symbol<E> *sym2 = get_symbol(ctx, sym->name());
+    if (sym2 != sym && sym2->file && !sym2->file->is_dso && !sym2->is_weak &&
+        sym2->ver_idx == (sym->ver_idx & ~VERSYM_HIDDEN)) {
+      ObjectFile<E> *file = sym->file->to_obj();
+      Error(ctx) << "duplicate symbol: " << *file << ": " << *sym2->file
+                 << ": " << file->get_symbol_name(sym->sym_idx);
+    }
+  }
 
   ctx.checkpoint();
 }
@@ -1166,17 +1258,20 @@ void convert_zero_to_bss(Context<E> &ctx) {
     if (!file->is_reachable)
       return;
 
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
-      if (isec && isec->is_alive &&
-          isec->shdr().sh_type == SHT_PROGBITS &&
+    for (InputSection<E> *isec : file->sections) {
+      if (!isec || !isec->is_alive)
+        continue;
+
+      std::string_view contents = isec->get_contents();
+      if (isec->shdr().sh_type == SHT_PROGBITS &&
           (isec->shdr().sh_flags & SHF_ALLOC) &&
           (isec->shdr().sh_flags & SHF_WRITE) &&
           !(isec->shdr().sh_flags & SHF_EXECINSTR) &&
           isec->get_rels(ctx).empty() &&
-          !isec->contents.empty() &&
-          isec->contents.find_first_not_of('\0') == isec->contents.npos) {
+          !contents.empty() &&
+          contents.find_first_not_of('\0') == contents.npos) {
         isec->shdr().sh_type = SHT_NOBITS;
-        isec->contents = {};
+        isec->contents = nullptr;
       }
     }
   });
@@ -1184,7 +1279,7 @@ void convert_zero_to_bss(Context<E> &ctx) {
 
 template <typename E>
 static bool has_dso_definition(Context<E> &ctx, Symbol<E> &sym) {
-  for (std::unique_ptr<SharedFile<E>> &file : ctx.dso_pool)
+  for (ArenaObjectPtr<SharedFile<E>> &file : ctx.dso_pool)
     for (i64 i = 0; i < file->symbols.size(); i++)
       if (file->symbols[i] == &sym && !file->elf_syms[i].is_undef())
         return true;
@@ -1216,7 +1311,7 @@ void check_shlib_undefined(Context<E> &ctx) {
   // symbol might be defined by that library.
   auto do_test = [&] {
     std::unordered_set<std::string_view> sonames;
-    for (std::unique_ptr<SharedFile<E>> &file : ctx.dso_pool)
+    for (ArenaObjectPtr<SharedFile<E>> &file : ctx.dso_pool)
       sonames.insert(file->soname);
 
     for (SharedFile<E> *file : ctx.dsos)
@@ -1307,7 +1402,7 @@ void check_symbol_types(Context<E> &ctx) {
 template <typename E>
 static i64 get_init_fini_priority(InputSection<E> *isec) {
   static std::regex re(R"(\.(\d+)$)", std::regex_constants::optimize);
-  std::string_view name = isec->name;
+  std::string_view name = isec->name();
   std::cmatch m;
   if (std::regex_search(name.data(), name.data() + name.size(), m, re))
     return std::stoi(m[1]);
@@ -1329,7 +1424,7 @@ static i64 get_ctor_dtor_priority(InputSection<E> *isec) {
   if (std::regex_search(isec->file.filename, re2))
     return 65536;
 
-  std::string_view name = isec->name;
+  std::string_view name = isec->name();
   std::cmatch m;
   if (std::regex_search(name.data(), name.data() + name.size(), m, re3))
     return std::stoi(m[1]);
@@ -1355,8 +1450,8 @@ void sort_init_fini(Context<E> &ctx) {
         std::vector<Entry> vec;
 
         for (InputSection<E> *isec : osec->members) {
-          if (isec->name.starts_with(".ctors") ||
-              isec->name.starts_with(".dtors"))
+          std::string_view name = isec->name();
+          if (name.starts_with(".ctors") || name.starts_with(".dtors"))
             vec.push_back({isec, 65535 - get_ctor_dtor_priority(isec)});
           else
             vec.push_back({isec, get_init_fini_priority(isec)});
@@ -1436,8 +1531,8 @@ static bool is_dwarf32(Context<E> &ctx, InputSection<E> *isec) {
   // we need to uncompress it before accessing `isec->contents`.
   isec->uncompress(ctx);
 
-  u8 *p = (u8 *)isec->contents.data() + *(U64<E> *)(buf + 4) + 12;
-  u8 *end = (u8 *)isec->contents.data() + isec->sh_size;
+  u8 *p = isec->contents + *(U64<E> *)(buf + 4) + 12;
+  u8 *end = isec->contents + isec->sh_size;
 
   while (end - p >= 12) {
     if (*(U32<E> *)p != 0xffff'ffff)
@@ -1490,7 +1585,7 @@ void sort_debug_info_sections(Context<E> &ctx) {
         if (osec->shdr.sh_size >= UINT32_MAX || is_in_test)
           vec1.push_back(osec);
 
-  for (std::unique_ptr<MergedSection<E>> &osec : ctx.merged_sections)
+  for (ArenaObjectPtr<MergedSection<E>> &osec : ctx.merged_sections)
     if (!(osec->shdr.sh_flags & SHF_ALLOC) && osec->name.starts_with(".debug_"))
       if (osec->shdr.sh_size >= UINT32_MAX || is_in_test)
         vec2.push_back(osec.get());
@@ -1551,7 +1646,7 @@ void fixup_ctors_in_init_array(Context<E> &ctx) {
     if (isec.sh_size % sizeof(Word<E>))
       Fatal(ctx) << isec << ": section corrupted";
 
-    u8 *buf = (u8 *)isec.contents.data();
+    u8 *buf = isec.contents;
     std::reverse((Word<E> *)buf, (Word<E> *)(buf + isec.sh_size));
 
     std::span<ElfRel<E>> rels = isec.get_rels(ctx);
@@ -1564,13 +1659,13 @@ void fixup_ctors_in_init_array(Context<E> &ctx) {
   if (Chunk<E> *chunk = find_chunk(ctx, ".init_array"))
     if (OutputSection<E> *osec = chunk->to_osec())
       for (InputSection<E> *isec : osec->members)
-        if (isec->name.starts_with(".ctors"))
+        if (isec->name().starts_with(".ctors"))
           reverse_contents(*isec);
 
   if (Chunk<E> *chunk = find_chunk(ctx, ".fini_array"))
     if (OutputSection<E> *osec = chunk->to_osec())
       for (InputSection<E> *isec : osec->members)
-        if (isec->name.starts_with(".dtors"))
+        if (isec->name().starts_with(".dtors"))
           reverse_contents(*isec);
 }
 
@@ -1725,13 +1820,14 @@ void claim_unresolved_symbols(Context<E> &ctx) {
                    << " symbol " << sym;
 
         sym.file = file;
-        sym.origin = 0;
+        sym.origin = nullptr;
         sym.value = 0;
         sym.sym_idx = i;
         sym.is_weak = false;
         sym.is_imported = is_imported;
         sym.is_exported = false;
-        sym.ver_idx = is_imported ? 0 : ctx.default_version;
+        sym.ver_idx =
+          is_imported ? (u16)VER_NDX_UNSPECIFIED : ctx.default_version;
       };
 
       if (esym.is_undef_weak()) {
@@ -1828,7 +1924,7 @@ void scan_relocations(Context<E> &ctx) {
     if (sym->flags & NEEDS_GOT)
       ctx.got->add_got_symbol(ctx, sym);
 
-    if (sym->flags & NEEDS_CPLT) {
+    if ((sym->flags & NEEDS_CANONICAL) && sym->get_type() == STT_FUNC) {
       sym->is_canonical = true;
 
       // A canonical PLT needs to be visible from DSOs.
@@ -1854,9 +1950,9 @@ void scan_relocations(Context<E> &ctx) {
     if (sym->flags & NEEDS_TLSDESC)
       ctx.got->add_tlsdesc_symbol(ctx, sym);
 
-    if (sym->flags & NEEDS_COPYREL) {
+    if ((sym->flags & NEEDS_CANONICAL) && sym->get_type() != STT_FUNC) {
       if (ctx.arg.z_relro && sym->file->is_dso &&
-          ((SharedFile<E> *)sym->file)->is_readonly(sym))
+          sym->file->to_dso()->is_readonly(sym))
         ctx.copyrel_relro->add_symbol(ctx, sym);
       else
         ctx.copyrel->add_symbol(ctx, sym);
@@ -2129,25 +2225,23 @@ void apply_version_script(Context<E> &ctx) {
   }
 
   if (!matcher.empty() || !cpp_matcher.empty()) {
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      for (Symbol<E> *sym : file->get_global_syms()) {
-        if (sym->file != file)
-          continue;
+    ctx.symbol_map.parallel_for_each([&](Symbol<E> &sym) {
+      if (!sym.file || sym.file->is_dso)
+        return;
 
-        std::string_view name = sym->name();
-        i64 match = matcher.find(name);
+      std::string_view name = sym.name();
+      i64 match = matcher.find(name);
 
-        // Match non-mangled symbols against the C++ pattern as well.
-        // Weird, but required to match other linkers' behavior.
-        if (!cpp_matcher.empty()) {
-          if (std::optional<std::string_view> s = demangle_cpp(name))
-            name = *s;
-          match = std::max(match, cpp_matcher.find(name));
-        }
-
-        if (match != -1)
-          sym->ver_idx = patterns[match].ver_idx;
+      // Match non-mangled symbols against the C++ pattern as well.
+      // Weird, but required to match other linkers' behavior.
+      if (!cpp_matcher.empty()) {
+        if (std::optional<std::string_view> s = demangle_cpp(name))
+          name = *s;
+        match = std::max(match, cpp_matcher.find(name));
       }
+
+      if (match != -1)
+        sym.ver_idx = patterns[match].ver_idx;
     });
   }
 
@@ -2192,7 +2286,7 @@ void parse_symbol_version(Context<E> &ctx) {
       if (sym->file != file)
         continue;
 
-      std::string_view name = file->symbol_names[i];
+      std::string_view name = file->get_symbol_name(i);
       std::string_view ver = name.substr(name.find('@') + 1);
 
       bool is_default = false;
@@ -2244,7 +2338,7 @@ static bool should_export(Context<E> &ctx, Symbol<E> &sym) {
       if (u32 ty = sym.get_type(); ty != STT_FUNC && ty != STT_GNU_IFUNC)
         return true;
     if (ctx.arg.shared)
-      return !((ObjectFile<E> *)sym.file)->exclude_libs;
+      return !sym.file->to_obj()->exclude_libs;
     return ctx.arg.export_dynamic;
   case VER_NDX_LOCAL:
     return false;
@@ -2359,23 +2453,21 @@ void compute_import_export(Context<E> &ctx) {
   }
 
   if (!matcher.empty() || !cpp_matcher.empty()) {
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      for (Symbol<E> *sym : file->get_global_syms()) {
-        if (sym->file != file)
-          continue;
-        if (ctx.arg.shared && !sym->is_exported)
-          continue;
+    ctx.symbol_map.parallel_for_each([&](Symbol<E> &sym) {
+      if (!sym.file || sym.file->is_dso)
+        return;
+      if (ctx.arg.shared && !sym.is_exported)
+        return;
 
-        std::string_view name = sym->name();
+      std::string_view name = sym.name();
 
-        if (matcher.find(name) != -1) {
-          handle_match(sym);
-        } else if (!cpp_matcher.empty()) {
-          if (std::optional<std::string_view> s = demangle_cpp(name))
-            name = *s;
-          if (cpp_matcher.find(name) != -1)
-            handle_match(sym);
-        }
+      if (matcher.find(name) != -1) {
+        handle_match(&sym);
+      } else if (!cpp_matcher.empty()) {
+        if (std::optional<std::string_view> s = demangle_cpp(name))
+          name = *s;
+        if (cpp_matcher.find(name) != -1)
+          handle_match(&sym);
       }
     });
   }
@@ -2419,9 +2511,9 @@ void compute_address_significance(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     // If .llvm_addrsig is available, use it.
-    if (InputSection<E> *sec = file->llvm_addrsig.get()) {
-      u8 *p = (u8 *)sec->contents.data();
-      u8 *end = p + sec->contents.size();
+    if (InputSection<E> *sec = file->llvm_addrsig) {
+      u8 *p = sec->contents;
+      u8 *end = p + sec->get_contents().size();
       while (p != end) {
         Symbol<E> *sym = file->symbols[read_uleb(&p)];
         if (InputSection<E> *isec = sym->get_input_section())
@@ -2431,7 +2523,7 @@ void compute_address_significance(Context<E> &ctx) {
     }
 
     // Otherwise, infer address significance.
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections) {
+    for (InputSection<E> *isec : file->sections) {
       if (!isec || !isec->is_alive || !(isec->shdr().sh_flags & SHF_ALLOC))
         continue;
 
@@ -3115,8 +3207,8 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   } else {
     // If the symbols are not ncessary, we turn them to absolute
     // symbols at address 0.
-    ctx.__rel_iplt_start->origin = 0;
-    ctx.__rel_iplt_end->origin = 0;
+    ctx.__rel_iplt_start->origin = nullptr;
+    ctx.__rel_iplt_end->origin = nullptr;
   }
 
   // __{init,fini}_array_{start,end}
@@ -3247,7 +3339,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
 
     if (u64 *addr = std::get_if<u64>(&val)) {
-      sym->origin = 0;
+      sym->origin = nullptr;
       sym->value = *addr;
     } else {
       Symbol<E> *sym2 = std::get<Symbol<E> *>(val);
@@ -3527,23 +3619,19 @@ void write_separate_debug_file(Context<E> &ctx) {
 
   copy_chunks(ctx);
 
-  if (ctx.gdb_index)
+  if (ctx.gdb_index) {
+    build_gdb_index_tables(ctx);
     write_gdb_index(ctx);
+  }
 
   // Reverse-compute a CRC32 value so that the CRC32 checksum embedded to
   // the .gnu_debuglink section in the main executable matches with the
   // debug info file's CRC32 checksum.
   u32 crc = compute_crc32(0, ctx.buf, ctx.output_file->filesize);
 
-  u8 *&buf2 = ctx.output_file->buf2;
-  i64 &buf2_size = ctx.output_file->buf2_size;
-  if (buf2)
-    crc = compute_crc32(crc, buf2, buf2_size);
-
   std::vector<u8> trailer = crc32_solve(crc, ctx.gnu_debuglink->crc32);
-  buf2 = (u8 *)realloc(buf2, buf2_size + trailer.size());
-  memcpy(buf2 + buf2_size, trailer.data(), trailer.size());
-  buf2_size += trailer.size();
+  memcpy(ctx.output_file->extend(ctx, trailer.size()),
+         trailer.data(), trailer.size());
   ctx.output_file->close(ctx);
 }
 
@@ -3589,7 +3677,7 @@ void show_stats(Context<E> &ctx) {
     static Counter undefined("undefined_syms");
     undefined += obj->symbols.size() - obj->first_global;
 
-    for (std::unique_ptr<InputSection<E>> &sec : obj->sections) {
+    for (InputSection<E> *sec : obj->sections) {
       if (!sec || !sec->is_alive)
         continue;
 
@@ -3607,12 +3695,12 @@ void show_stats(Context<E> &ctx) {
 
     static Counter removed_comdats("removed_comdat_mem");
     for (ComdatGroupRef<E> &ref : obj->comdat_groups)
-      if (ref.group->owner != obj->priority)
-        removed_comdats += ref.members.size();
+      if (!ref.is_owner)
+        removed_comdats += ref.members(*obj).size();
 
     static Counter unique_comdats("unique_comdats");
     for (ComdatGroupRef<E> &ref : obj->comdat_groups)
-      if (ref.group->owner == obj->priority)
+      if (ref.is_owner)
         unique_comdats++;
 
     static Counter num_cies("num_cies");
@@ -3642,7 +3730,7 @@ void show_stats(Context<E> &ctx) {
   using Entry = typename ConcurrentMap<SectionFragment<E>>::Entry;
 
   static Counter merged_strings("merged_strings");
-  for (std::unique_ptr<MergedSection<E>> &sec : ctx.merged_sections)
+  for (ArenaObjectPtr<MergedSection<E>> &sec : ctx.merged_sections)
     for (Entry &ent : std::span(sec->map.entries, sec->map.nbuckets))
       if (ent.key)
         merged_strings++;
@@ -3666,7 +3754,7 @@ void show_stats(Context<E> &ctx) {
 
   Counter::print();
 
-  for (std::unique_ptr<MergedSection<E>> &sec : ctx.merged_sections)
+  for (ArenaObjectPtr<MergedSection<E>> &sec : ctx.merged_sections)
     sec->print_stats(ctx);
 }
 
@@ -3676,6 +3764,7 @@ template int redo_main<E>(std::string_view, int, char **);
 template void create_internal_file(Context<E> &);
 template void apply_exclude_libs(Context<E> &);
 template void create_synthetic_sections(Context<E> &);
+template void gather_symbols(Context<E> &);
 template void resolve_symbols(Context<E> &);
 template void do_lto(Context<E> &);
 template void parse_eh_frame_sections(Context<E> &);
@@ -3689,6 +3778,7 @@ template void apply_section_align(Context<E> &);
 template void print_dependencies(Context<E> &);
 template void write_repro_file(Context<E> &);
 template void check_duplicate_symbols(Context<E> &);
+template void check_symbol_version_conflicts(Context<E> &);
 template void convert_zero_to_bss(Context<E> &);
 template void check_shlib_undefined(Context<E> &);
 template void check_symbol_types(Context<E> &);

@@ -286,12 +286,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
-  std::span<const ElfRel<E>> rels = get_rels(ctx);
-
-  for (i64 i = 0; i < rels.size(); i++) {
-    const ElfRel<E> &rel = rels[i];
+  for_each_reloc(ctx, [&](const ElfRel<E> &rel, i64) ALWAYS_INLINE {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
-      continue;
+      return;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
@@ -310,11 +307,17 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       else
         *(U32<E> *)loc = S + A;
       break;
+    case R_SH_TLS_LDO_32:
+      if (std::optional<u64> val = get_tombstone(sym, frag))
+        *(U32<E> *)loc = *val;
+      else
+        *(U32<E> *)loc = S + A - ctx.dtp_addr;
+      break;
     default:
       Fatal(ctx) << *this << ": invalid relocation for non-allocated sections: "
                  << rel;
     }
-  }
+  });
 }
 
 template <>

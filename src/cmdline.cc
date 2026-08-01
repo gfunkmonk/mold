@@ -47,7 +47,7 @@ Options:
                               Set DT_DEPAUDIT to the specified value
   -S, --strip-debug           Strip .debug_* sections
   -T FILE, --script FILE      Read linker script
-  -X, --discard-locals        Discard temporary local symbols
+  -X, --discard-locals        Discard temporary local symbols (default)
   -e SYMBOL, --entry SYMBOL   Set program entry point
   -f SHLIB, --auxiliary SHLIB Set DT_AUXILIARY to the specified value
   -h LIBNAME, --soname LIBNAME
@@ -98,6 +98,7 @@ Options:
     --no-demangle
   --detach                    Create separate debug info file in the background (default)
     --no-detach
+  --discard-none              Keep all local symbols in the symbol table
   --enable-new-dtags          Emit DT_RUNPATH for --rpath (default)
     --disable-new-dtags       Emit DT_RPATH for --rpath
   --execute-only              Make executable segments unreadable
@@ -371,19 +372,40 @@ static std::string_view string_trim(std::string_view str) {
   return str.substr(0, pos + 1);
 }
 
-static std::vector<std::string> add_dashes(std::string name) {
-  // Single-letter option
-  if (name.size() == 1)
-    return {"-" + name};
+// This function matches a command line argument against an option
+// name and, on success, returns the remainder of the argument. For
+// example, matching "--foo=bar" against "foo" yields "=bar", and
+// matching "--foo" against "foo" yields an empty string. On
+// mismatch, it returns std::nullopt.
+//
+// Multi-letter option names can be preceded by either a single dash
+// or double dashes except ones starting with "o", which must be
+// preceded by double dashes. For example, "-omagic" is interpreted
+// as "-o magic". If you really want to specify the "omagic" option,
+// you have to pass "--omagic". Single-letter option names take a
+// single dash.
+static std::optional<std::string_view>
+match_option(std::string_view arg, std::string_view name) {
+  assert(arg.starts_with('-'));
+  arg.remove_prefix(1);
 
-  // Multi-letter linker options can be preceded by either a single
-  // dash or double dashes except ones starting with "o", which must
-  // be preceded by double dashes. For example, "-omagic" is
-  // interpreted as "-o magic". If you really want to specify the
-  // "omagic" option, you have to pass "--omagic".
-  if (name[0] == 'o')
-    return {"--" + name};
-  return {"-" + name, "--" + name};
+  // Single-letter option
+  if (name.size() == 1) {
+    if (arg.starts_with(name))
+      return arg.substr(1);
+    return {};
+  }
+
+  // Options beginning with "o" require double dashes
+  if (name[0] == 'o' && !arg.starts_with('-'))
+    return {};
+
+  if (arg.starts_with('-'))
+    arg.remove_prefix(1);
+
+  if (arg.starts_with(name))
+    return arg.substr(name.size());
+  return {};
 }
 
 template <typename E>
@@ -608,11 +630,18 @@ static bool returns_etxtbsy() {
 }
 
 template <typename E>
-std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
+std::vector<ReaderJob> parse_nonpositional_args(Context<E> &ctx) {
   std::span<std::string_view> args = ctx.cmdline_args;
   args = args.subspan(1);
 
-  std::vector<std::string> remaining;
+  // Input file arguments are turned into ReaderJobs for
+  // read_input_files(). rctx tracks the reader state options, such as
+  // --as-needed, that apply to the files after them; each job gets a
+  // snapshot of the state at its position.
+  std::vector<ReaderJob> jobs;
+  ReaderContext rctx;
+  std::vector<ReaderContext> rctx_stack;
+  std::unordered_set<std::string_view> visited_libs;
   std::string_view arg;
 
   ctx.arg.color_diagnostics = isatty(STDERR_FILENO);
@@ -638,11 +667,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     }
   };
 
-  // RISC-V and LoongArch object files contains lots of local symbols,
-  // so by default we discard them. This is compatible with GNU ld.
-  if constexpr (is_riscv<E> || is_loongarch<E>)
-    ctx.arg.discard_locals = true;
-
   // We generally don't need to write addends to relocated places if the
   // relocation type is RELA because RELA records contain addends.
   // However, there are too much code that wrongly assumes that addends
@@ -657,76 +681,95 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   //   we write addends to relocated places.
   ctx.arg.apply_dynamic_relocs = !is_sparc<E> && !is_riscv<E>;
 
-  auto read_arg = [&](std::string name) {
-    for (const std::string &opt : add_dashes(name)) {
-      if (args[0] == opt) {
-        if (args.size() == 1)
-          Fatal(ctx) << "option -" << name << ": argument missing";
-        arg = args[1];
-        args = args.subspan(2);
-        return true;
-      }
+  auto read_arg = [&](std::string_view name) {
+    std::optional<std::string_view> rest = match_option(args[0], name);
+    if (!rest)
+      return false;
 
-      std::string prefix = (name.size() == 1) ? opt : opt + "=";
-      if (args[0].starts_with(prefix)) {
-        arg = args[0].substr(prefix.size());
-        args = args.subspan(1);
-        return true;
-      }
+    // An option and its argument are either separate command line
+    // arguments or a single one, as in "-o foo" vs. "-ofoo" or
+    // "--output foo" vs. "--output=foo".
+    if (rest->empty()) {
+      if (args.size() == 1)
+        Fatal(ctx) << "option -" << name << ": argument missing";
+      arg = args[1];
+      args = args.subspan(2);
+      return true;
+    }
+
+    if (name.size() == 1) {
+      arg = *rest;
+      args = args.subspan(1);
+      return true;
+    }
+
+    if (rest->starts_with('=')) {
+      arg = rest->substr(1);
+      args = args.subspan(1);
+      return true;
     }
     return false;
   };
 
-  auto read_eq = [&](std::string name) {
-    for (const std::string &opt : add_dashes(name)) {
-      if (args[0].starts_with(opt + "=")) {
-        arg = args[0].substr(opt.size() + 1);
-        args = args.subspan(1);
-        return true;
-      }
+  auto read_eq = [&](std::string_view name) {
+    std::optional<std::string_view> rest = match_option(args[0], name);
+    if (rest && rest->starts_with('=')) {
+      arg = rest->substr(1);
+      args = args.subspan(1);
+      return true;
     }
     return false;
   };
 
-  auto read_flag = [&](std::string name) {
-    for (const std::string &opt : add_dashes(name)) {
-      if (args[0] == opt) {
-        args = args.subspan(1);
-        return true;
-      }
+  auto read_flag = [&](std::string_view name) {
+    if (match_option(args[0], name) == "") {
+      args = args.subspan(1);
+      return true;
     }
     return false;
   };
 
-  auto read_z_flag = [&](std::string name) {
+  auto read_z_flag = [&](std::string_view name) {
     if (args.size() >= 2 && args[0] == "-z" && args[1] == name) {
       args = args.subspan(2);
       return true;
     }
 
-    if (!args.empty() && args[0] == "-z" + name) {
+    if (args[0].starts_with("-z") && args[0].substr(2) == name) {
       args = args.subspan(1);
       return true;
     }
     return false;
   };
 
-  auto read_z_arg = [&](std::string name) {
-    if (args.size() >= 2 && args[0] == "-z" && args[1].starts_with(name + "=")) {
+  auto read_z_arg = [&](std::string_view name) {
+    if (args.size() >= 2 && args[0] == "-z" && args[1].starts_with(name) &&
+        args[1].substr(name.size()).starts_with('=')) {
       arg = args[1].substr(name.size() + 1);
       args = args.subspan(2);
       return true;
     }
 
-    if (!args.empty() && args[0].starts_with("-z" + name + "=")) {
-      arg = args[0].substr(name.size() + 3);
-      args = args.subspan(1);
-      return true;
+    if (args[0].starts_with("-z")) {
+      std::string_view s = args[0].substr(2);
+      if (s.starts_with(name) && s.substr(name.size()).starts_with('=')) {
+        arg = s.substr(name.size() + 1);
+        args = args.subspan(1);
+        return true;
+      }
     }
     return false;
   };
 
   while (!args.empty()) {
+    if (!args[0].starts_with('-')) {
+      ReaderJob job = {rctx, std::string(args[0])};
+      job.rctx.pos = {(u32)jobs.size()};
+      jobs.push_back(std::move(job));
+      args = args.subspan(1);
+      continue;
+    }
+
     if (read_flag("help")) {
       Out(ctx) << "Usage: " << ctx.cmdline_args[0]
                << " [options] file...\n" << helpmsg;
@@ -828,7 +871,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
     } else if (read_flag("end-lib")) {
-      remaining.emplace_back("--end-lib");
+      rctx.in_lib = false;
     } else if (read_flag("export-dynamic") || read_flag("E")) {
       ctx.arg.export_dynamic = true;
     } else if (read_flag("no-export-dynamic")) {
@@ -859,9 +902,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("print-map") || read_flag("M")) {
       ctx.arg.print_map = true;
     } else if (read_flag("Bstatic") || read_flag("dn") || read_flag("static")) {
-      remaining.emplace_back("--Bstatic");
+      rctx.static_ = true;
     } else if (read_flag("Bdynamic") || read_flag("dy")) {
-      remaining.emplace_back("--Bdynamic");
+      rctx.static_ = false;
     } else if (read_flag("shared") || read_flag("Bshareable")) {
       ctx.arg.shared = true;
     } else if (read_arg("spare-dynamic-tags")) {
@@ -870,7 +913,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.spare_program_headers
         = parse_number(ctx, "spare-program-headers", arg);
     } else if (read_flag("start-lib")) {
-      remaining.emplace_back("--start-lib");
+      rctx.in_lib = true;
     } else if (read_flag("start-stop")) {
       ctx.arg.start_stop = true;
     } else if (read_arg("dependency-file")) {
@@ -1080,7 +1123,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.wrap.insert(arg);
     } else if (read_flag("omagic") || read_flag("N")) {
       ctx.arg.omagic = true;
-      remaining.emplace_back("--Bstatic");
+      rctx.static_ = true;
     } else if (read_flag("no-omagic")) {
       ctx.arg.omagic = false;
     } else if (read_arg("oformat")) {
@@ -1344,6 +1387,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.discard_all = true;
     } else if (read_flag("discard-locals") || read_flag("X")) {
       ctx.arg.discard_locals = true;
+    } else if (read_flag("discard-none")) {
+      ctx.arg.discard_all = false;
+      ctx.arg.discard_locals = false;
     } else if (read_flag("strip-all") || read_flag("s")) {
       ctx.arg.strip_all = true;
     } else if (read_flag("strip-debug") || read_flag("S")) {
@@ -1462,21 +1508,31 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("export-dynamic-symbol-list")) {
       append(ctx.dynamic_list_patterns, parse_dynamic_list(ctx, arg));
     } else if (read_flag("as-needed")) {
-      remaining.emplace_back("--as-needed");
+      rctx.as_needed = true;
     } else if (read_flag("no-as-needed")) {
-      remaining.emplace_back("--no-as-needed");
+      rctx.as_needed = false;
     } else if (read_flag("whole-archive")) {
-      remaining.emplace_back("--whole-archive");
+      rctx.whole_archive = true;
     } else if (read_flag("no-whole-archive")) {
-      remaining.emplace_back("--no-whole-archive");
+      rctx.whole_archive = false;
     } else if (read_arg("l") || read_arg("library")) {
-      remaining.push_back("-l" + std::string(arg));
+      if (visited_libs.insert(arg).second) {
+        ReaderJob job = {rctx, std::string(arg)};
+        job.is_lib = true;
+        job.rctx.pos = {(u32)jobs.size()};
+        jobs.push_back(std::move(job));
+      }
     } else if (read_arg("script") || read_arg("T")) {
-      remaining.emplace_back(arg);
+      ReaderJob job = {rctx, std::string(arg)};
+      job.rctx.pos = {(u32)jobs.size()};
+      jobs.push_back(std::move(job));
     } else if (read_flag("push-state")) {
-      remaining.emplace_back("--push-state");
+      rctx_stack.push_back(rctx);
     } else if (read_flag("pop-state")) {
-      remaining.emplace_back("--pop-state");
+      if (rctx_stack.empty())
+        Fatal(ctx) << "no state pushed before popping";
+      rctx = rctx_stack.back();
+      rctx_stack.pop_back();
     } else if (args[0].starts_with("-z") && args[0].size() > 2) {
       Warn(ctx) << "unknown command line option: " << args[0];
       args = args.subspan(1);
@@ -1487,10 +1543,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       Fatal(ctx) << "unknown command line option: -dynamic; -dynamic is a "
                  << "macOS linker's option. mold does not support macOS.";
     } else {
-      if (args[0].starts_with('-'))
-        Fatal(ctx) << "unknown command line option: " << args[0];
-      remaining.emplace_back(args[0]);
-      args = args.subspan(1);
+      Fatal(ctx) << "unknown command line option: " << args[0];
     }
   }
 
@@ -1685,14 +1738,19 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     sym->gc_root = true;
   ctx.arg.entry->gc_root = true;
 
-  if (version_shown && remaining.empty())
+  if (version_shown && jobs.empty())
     exit(0);
-  return remaining;
+
+  if (rctx.static_ || ctx.arg.relocatable) {
+    ctx.arg.static_ = true;
+    ctx.arg.dynamic_linker = "";
+  }
+  return jobs;
 }
 
 using E = MOLD_TARGET;
 
 template std::vector<std::string_view> expand_response_files(Context<E> &, char **);
-template std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
+template std::vector<ReaderJob> parse_nonpositional_args(Context<E> &ctx);
 
 } // namespace mold

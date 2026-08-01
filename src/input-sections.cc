@@ -31,17 +31,20 @@ bool cie_equals(const CieRecord<E> &a, const CieRecord<E> &b) {
 }
 
 template <typename E>
-InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx)
+InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx,
+                              std::string_view section_name)
   : file(file), shndx(shndx) {
   if (shndx < file.elf_sections.size()) {
-    name = file.shstrtab.data() + file.elf_sections[shndx].sh_name;
-    contents = {(char *)file.mf->data + shdr().sh_offset, (size_t)shdr().sh_size};
-  } else {
-    name = (shdr().sh_flags & SHF_TLS) ? ".tls_common" : ".common";
+    std::string_view name = section_name;
+    if (name.empty())
+      name = file.shstrtab.data() + file.elf_sections[shndx].sh_name;
+    namelen = std::min<i64>(name.size(), UINT16_MAX);
+
+    contents = file.mf->data + shdr().sh_offset;
   }
 
   if (shdr().sh_flags & SHF_COMPRESSED) {
-    ElfChdr<E> &chdr = *(ElfChdr<E> *)&contents[0];
+    ElfChdr<E> &chdr = *(ElfChdr<E> *)contents;
     sh_size = chdr.ch_size;
     p2align = to_p2align(chdr.ch_addralign);
   } else {
@@ -68,7 +71,7 @@ void InputSection<E>::uncompress(Context<E> &ctx) {
 
   u8 *buf = new u8[sh_size];
   copy_contents_to(ctx, buf, sh_size);
-  contents = std::string_view((char *)buf, sh_size);
+  contents = buf;
   ctx.string_pool.emplace_back(buf);
   uncompressed = true;
 }
@@ -76,15 +79,16 @@ void InputSection<E>::uncompress(Context<E> &ctx) {
 template <typename E>
 void InputSection<E>::copy_contents_to(Context<E> &ctx, u8 *buf, i64 sz) {
   if (!(shdr().sh_flags & SHF_COMPRESSED) || uncompressed) {
-    memcpy(buf, contents.data(), sz);
+    memcpy(buf, contents, sz);
     return;
   }
 
-  if (contents.size() < sizeof(ElfChdr<E>))
+  std::string_view view = get_contents();
+  if (view.size() < sizeof(ElfChdr<E>))
     Fatal(ctx) << *this << ": corrupted compressed section";
 
-  ElfChdr<E> &hdr = *(ElfChdr<E> *)&contents[0];
-  std::string_view data = contents.substr(sizeof(ElfChdr<E>));
+  ElfChdr<E> &hdr = *(ElfChdr<E> *)contents;
+  std::string_view data = view.substr(sizeof(ElfChdr<E>));
 
   switch (hdr.ch_type) {
   case ELFCOMPRESS_ZLIB: {
@@ -128,7 +132,7 @@ void InputSection<E>::copy_contents_to(Context<E> &ctx, u8 *buf, i64 sz) {
 // wingdi.h defines ERROR as a macro, so undefine it before use
 #undef ERROR
 
-typedef enum : u8 { NONE, ERROR, COPYREL, PLT, CPLT } Action;
+typedef enum : u8 { NONE, ERROR, CANONICAL, PLT } Action;
 
 template <typename E>
 static void do_action(Context<E> &ctx, Action action, InputSection<E> &isec,
@@ -141,16 +145,12 @@ static void do_action(Context<E> &ctx, Action action, InputSection<E> &isec,
                << std::hex << rel.r_offset << " against symbol `"
                << sym << "' can not be used; recompile with -fPIC";
     break;
-  case COPYREL:
-    sym.flags |= NEEDS_COPYREL;
+  case CANONICAL:
+    sym.flags |= NEEDS_CANONICAL;
     break;
   case PLT:
     // Create a PLT entry
     sym.flags |= NEEDS_PLT;
-    break;
-  case CPLT:
-    // Create a canonical PLT entry
-    sym.flags |= NEEDS_CPLT;
     break;
   }
 }
@@ -183,9 +183,9 @@ void InputSection<E>::scan_pcrel(Context<E> &ctx, Symbol<E> &sym,
   // linker generally does not support PC-relative relocations.
   static Action table[][4] = {
     // Absolute  Local    Imported data  Imported code
-    {  ERROR,    NONE,    ERROR,         PLT    },  // Shared object
-    {  ERROR,    NONE,    COPYREL,       CPLT   },  // Position-independent exec
-    {  NONE,     NONE,    COPYREL,       CPLT   },  // Position-dependent exec
+    {  ERROR,    NONE,    ERROR,         PLT       }, // Shared object
+    {  ERROR,    NONE,    CANONICAL,     CANONICAL }, // Position-independent exec
+    {  NONE,     NONE,    CANONICAL,     CANONICAL }, // Position-dependent exec
   };
 
   Action action = table[get_output_type(ctx)][get_sym_type(sym)];
@@ -202,9 +202,9 @@ void InputSection<E>::scan_absrel(Context<E> &ctx, Symbol<E> &sym,
   // resolved at link-time.
   static Action table[][4] = {
     // Absolute  Local    Imported data  Imported code
-    {  NONE,     ERROR,   ERROR,         ERROR },  // Shared object
-    {  NONE,     ERROR,   ERROR,         ERROR },  // Position-independent exec
-    {  NONE,     NONE,    COPYREL,       CPLT  },  // Position-dependent exec
+    {  NONE,     ERROR,   ERROR,         ERROR     }, // Shared object
+    {  NONE,     ERROR,   ERROR,         ERROR     }, // Position-independent exec
+    {  NONE,     NONE,    CANONICAL,     CANONICAL }, // Position-dependent exec
   };
 
   Action action = table[get_output_type(ctx)][get_sym_type(sym)];
@@ -259,15 +259,18 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
       copy_contents_to(ctx, buf, sh_size);
     } else {
       // A relaxed section is copied piece-wise.
-      memcpy(buf, contents.data(), deltas[0].offset);
+      memcpy(buf, contents, deltas[0].offset);
 
+      i64 input_size = get_contents().size();
       for (i64 i = 0; i < deltas.size(); i++) {
         i64 offset = deltas[i].offset;
         i64 delta = deltas[i].delta;
-        i64 end = (i + 1 == deltas.size()) ? contents.size() : deltas[i + 1].offset;
+        i64 end = input_size;
+        if (i + 1 < deltas.size())
+          end = deltas[i + 1].offset;
         i64 removed_bytes = get_removed_bytes(deltas, i);
         memcpy(buf + offset + removed_bytes - delta,
-               contents.data() + offset + removed_bytes,
+               contents + offset + removed_bytes,
                end - offset - removed_bytes);
       }
     }
@@ -309,10 +312,10 @@ bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) 
   Symbol<E> &sym = *file.symbols[rel.r_sym];
   const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
 
-  // If a symbol is defined in a comdat group, and the comdat group is
-  // discarded, the symbol may not have an owner. It is technically an
-  // violation of the One Definition Rule, so it is a programmer's fault.
-  if (!sym.file) {
+  // A global symbol in a discarded COMDAT group should resolve to the
+  // corresponding symbol in the prevailing group. If it does not, the
+  // object files violate the One Definition Rule.
+  if (!sym.file && &sym != discarded_comdat_sym<E>) {
     Error(ctx) << *this << ": " << sym << " refers to a discarded COMDAT section"
                << " probably due to an ODR violation";
     return true;
@@ -359,8 +362,8 @@ bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) 
 
 template <typename E>
 MergeableSection<E>::MergeableSection(Context<E> &ctx, MergedSection<E> &parent,
-                                      std::unique_ptr<InputSection<E>> &isec)
-  : parent(parent), p2align(isec->p2align), input_section(std::move(isec)) {
+                                      InputSection<E> *isec)
+  : parent(parent), p2align(isec->p2align), input_section(isec) {
   input_section->uncompress(ctx);
 
   std::scoped_lock lock(parent.mu);
@@ -397,7 +400,7 @@ static size_t find_null(std::string_view data, i64 pos, i64 entsize) {
 // We do not support mergeable sections that have relocations.
 template <typename E>
 void MergeableSection<E>::split_contents(Context<E> &ctx) {
-  std::string_view data = input_section->contents;
+  std::string_view data = input_section->get_contents();
   if (data.size() > UINT32_MAX)
     Fatal(ctx) << *input_section << ": mergeable section too large";
 
@@ -423,16 +426,14 @@ void MergeableSection<E>::split_contents(Context<E> &ctx) {
   }
 
   // Compute hashes for section pieces
-  HyperLogLog estimator;
+  HyperLogLog::Sketch &sketch = parent.estimator.local();
   hashes.reserve(frag_offsets.size());
 
   for (i64 i = 0; i < frag_offsets.size(); i++) {
     u64 hash = hash_string(get_contents(i));
     hashes.push_back(hash);
-    estimator.insert(hash);
+    sketch.insert(hash);
   }
-
-  parent.estimator.merge(estimator);
 
   static Counter counter("string_fragments");
   counter += frag_offsets.size();

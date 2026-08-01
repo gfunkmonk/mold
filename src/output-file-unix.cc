@@ -1,3 +1,4 @@
+#include "config.h"
 #include "mold.h"
 
 #include <fcntl.h>
@@ -58,18 +59,34 @@ public:
 
     output_tmpfile = (char *)save_string(ctx, tmpfile).data();
 
-#ifdef __linux__
-    // Calling falllocate speeds up later linking passes on ext4,
-    // while it just takes time with not benefits on tmpfs.
+#if HAVE_FALLOCATE
+    // Calling fallocate speeds up later linking passes on ext4 by
+    // taking disk block allocation out of the page-fault handler.
+    // On tmpfs, it instead makes things much slower: the kernel
+    // allocates and zeroes every page of the range inside the
+    // syscall, on one thread, which takes ~1.8 s for a 5 GiB file.
     if (struct statfs fs;
         fstatfs(this->fd, &fs) || fs.f_type != TMPFS_MAGIC)
       fallocate(this->fd, 0, 0, filesize);
 #endif
 
-    this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
+    // We map the file with twice as much address space as its size, so
+    // that extend() can grow the file into the mapping in place.
+    // Touching the mapping beyond the end of the file is not allowed,
+    // but growing the file with ftruncate makes the tail of the
+    // mapping accessible without any further mmap call.
+    vasize = filesize * 2;
+    this->buf = (u8 *)mmap(nullptr, vasize, PROT_READ | PROT_WRITE,
                            MAP_SHARED, this->fd, 0);
-    if (this->buf == MAP_FAILED)
-      Fatal(ctx) << path << ": mmap failed: " << errno_string();
+
+    if (this->buf == MAP_FAILED) {
+      // If the address space is too tight, map just the file.
+      vasize = filesize;
+      this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, this->fd, 0);
+      if (this->buf == MAP_FAILED)
+        Fatal(ctx) << path << ": mmap failed: " << errno_string();
+    }
 
     mold::output_buffer_start = this->buf;
     mold::output_buffer_end = this->buf + filesize;
@@ -80,20 +97,51 @@ public:
       ::close(fd2);
   }
 
+  // Extend the file so that the caller can fill the appended data
+  // through the tail of the mapping. This is called at most once per
+  // output file.
+  u8 *extend(Context<E> &ctx, i64 size) override {
+    i64 mapsize = this->filesize;
+
+    if (ftruncate(this->fd, mapsize + size) == -1)
+      Fatal(ctx) << "ftruncate failed: " << errno_string();
+
+#if HAVE_FALLOCATE
+    if (struct statfs fs;
+        fstatfs(this->fd, &fs) || fs.f_type != TMPFS_MAGIC)
+      fallocate(this->fd, 0, mapsize, size);
+#endif
+
+    if (mapsize + size > vasize) {
+      // The appended data does not fit in the mapping. Map the grown
+      // file again, moving the buffer.
+      munmap(this->buf, vasize);
+      vasize = mapsize + size;
+
+      this->buf = (u8 *)mmap(nullptr, vasize, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, this->fd, 0);
+      if (this->buf == MAP_FAILED)
+        Fatal(ctx) << this->path << ": mmap failed: " << errno_string();
+
+      ctx.buf = this->buf;
+      mold::output_buffer_start = this->buf;
+    }
+
+    this->filesize += size;
+    mold::output_buffer_end = this->buf + mapsize + size;
+
+#ifdef MADV_HUGEPAGE
+    madvise(this->buf, mapsize + size, MADV_HUGEPAGE);
+#endif
+    return this->buf + mapsize;
+  }
+
   void close(Context<E> &ctx) override {
     Timer t(ctx, "close_file");
 
     if (!this->is_unmapped)
-      munmap(this->buf, this->filesize);
-
-    if (!this->buf2) {
-      ::close(this->fd);
-    } else {
-      FILE *out = fdopen(this->fd, "w");
-      fseek(out, 0, SEEK_END);
-      fwrite(this->buf2, this->buf2_size, 1, out);
-      fclose(out);
-    }
+      munmap(this->buf, vasize);
+    ::close(this->fd);
 
     // If an output file already exists, open a file and then remove it.
     // This is the fastest way to unlink a file, as it does not make the
@@ -109,6 +157,9 @@ public:
 
 private:
   int fd2 = -1;
+
+  // Size of the file mapping, which may extend past the end of the file.
+  i64 vasize = 0;
 };
 
 template <typename E>
@@ -163,10 +214,20 @@ void LockingOutputFile<E>::resize(Context<E> &ctx, i64 filesize) {
   if (ftruncate(this->fd, filesize) == -1)
     Fatal(ctx) << "ftruncate failed: " << errno_string();
 
-  this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
+  // As in MemoryMappedOutputFile, we map the file with twice as much
+  // address space as its size so that extend() can grow the file into
+  // the mapping in place.
+  vasize = filesize * 2;
+  this->buf = (u8 *)mmap(nullptr, vasize, PROT_READ | PROT_WRITE,
                          MAP_SHARED, this->fd, 0);
-  if (this->buf == MAP_FAILED)
-    Fatal(ctx) << this->path << ": mmap failed: " << errno_string();
+
+  if (this->buf == MAP_FAILED) {
+    vasize = filesize;
+    this->buf = (u8 *)mmap(nullptr, filesize, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, this->fd, 0);
+    if (this->buf == MAP_FAILED)
+      Fatal(ctx) << this->path << ": mmap failed: " << errno_string();
+  }
 
   this->filesize = filesize;
   mold::output_buffer_start = this->buf;
@@ -174,17 +235,36 @@ void LockingOutputFile<E>::resize(Context<E> &ctx, i64 filesize) {
 }
 
 template <typename E>
-void LockingOutputFile<E>::close(Context<E> &ctx) {
-  if (!this->is_unmapped)
-    munmap(this->buf, this->filesize);
+u8 *LockingOutputFile<E>::extend(Context<E> &ctx, i64 size) {
+  i64 mapsize = this->filesize;
 
-  if (this->buf2) {
-    FILE *out = fdopen(this->fd, "w");
-    fseek(out, 0, SEEK_END);
-    fwrite(this->buf2, this->buf2_size, 1, out);
-    fclose(out);
+  if (ftruncate(this->fd, mapsize + size) == -1)
+    Fatal(ctx) << "ftruncate failed: " << errno_string();
+
+  if (mapsize + size > vasize) {
+    // The appended data does not fit in the mapping. Map the grown
+    // file again, moving the buffer.
+    munmap(this->buf, vasize);
+    vasize = mapsize + size;
+
+    this->buf = (u8 *)mmap(nullptr, vasize, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, this->fd, 0);
+    if (this->buf == MAP_FAILED)
+      Fatal(ctx) << this->path << ": mmap failed: " << errno_string();
+
+    ctx.buf = this->buf;
+    mold::output_buffer_start = this->buf;
   }
 
+  this->filesize += size;
+  mold::output_buffer_end = this->buf + mapsize + size;
+  return this->buf + mapsize;
+}
+
+template <typename E>
+void LockingOutputFile<E>::close(Context<E> &ctx) {
+  if (!this->is_unmapped)
+    munmap(this->buf, vasize);
   ::close(this->fd);
 }
 

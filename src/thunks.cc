@@ -120,10 +120,11 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
     return;
 
   // Initialize input sections with a dummy offset so that we can
-  // distinguish sections that have got an address with the one who
-  // haven't.
-  for (InputSection<E> *isec : m)
+  // distinguish sections whose addresses have been assigned from those
+  // whose addresses have not.
+  tbb::parallel_for_each(m, [](InputSection<E> *isec) {
     isec->offset = -1;
+  });
   thunks.clear();
 
   // We create thunks from the beginning of the section to the end.
@@ -169,17 +170,21 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
       d++;
     }
 
-    // Move C forward so that C is apart from B by BATCH_SIZE. We want
-    // to make sure that there's at least one section between B and C
-    // to ensure progress.
-    c = b + 1;
-    while (c < d && m[c]->offset + m[c]->sh_size < m[b]->offset + batch_size)
-      c++;
+    // Find the end of the current batch. Section end addresses are sorted,
+    // so use binary search. Starting from B + 1 guarantees progress.
+    std::span<InputSection<E> *> range = m.subspan(b + 1, d - b - 1);
+    c = ranges::lower_bound(range, m[b]->offset + batch_size, {},
+                            [](InputSection<E> *isec) {
+                              return isec->offset + isec->sh_size;
+                            }) - m.begin();
 
-    // Move A forward so that A is reachable from C.
+    // Find the first section that is within branch range of C.
     i64 c_offset = (c == d) ? offset : m[c]->offset;
-    while (a < b && m[a]->offset + branch_distance<E> < c_offset)
-      a++;
+    range = m.subspan(a, b - a);
+    a = ranges::lower_bound(range, c_offset - branch_distance<E>, {},
+                            [](InputSection<E> *isec) {
+                              return isec->offset;
+                            }) - m.begin();
 
     // Erase references to out-of-range thunks.
     for (; t < thunks.size() && thunks[t]->offset < m[a]->offset; t++)
@@ -191,27 +196,22 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
     thunks.emplace_back(std::make_unique<Thunk<E>>(*this, offset));
 
     Thunk<E> &thunk = *thunks.back();
-    std::mutex mu;
+    tbb::enumerable_thread_specific<std::vector<Symbol<E> *>> symbols;
 
     // Scan relocations between B and C to collect symbols that need
     // entries in the new thunk.
     tbb::parallel_for(b, c, [&](i64 i) {
       InputSection<E> &isec = *m[i];
-      for (const ElfRel<E> &rel : isec.get_rels(ctx)) {
-        if (requires_thunk(ctx, isec, rel, true)) {
+      for (const ElfRel<E> &rel : isec.get_rels(ctx))
+        if (requires_thunk(ctx, isec, rel, true))
           if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-              !sym.flags.test_and_set()) {
-            std::scoped_lock lock(mu);
-            thunk.symbols.push_back(&sym);
-          }
-        }
-      }
+              !sym.flags.test_and_set())
+            symbols.local().push_back(&sym);
     });
 
-    // Sort symbols added to the thunk to make the output deterministic.
-    ranges::sort(thunk.symbols, {}, [](Symbol<E> *x) {
-      return std::tuple{x->file->priority, x->sym_idx};
-    });
+    // Add symbols to the thunk
+    for (std::vector<Symbol<E> *> &vec : symbols)
+      append(thunk.symbols, vec);
 
     // Now that we know the number of symbols in the thunk, we can compute
     // the thunk's size.
@@ -223,10 +223,17 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
     b = c;
   }
 
-  // Reset flags for future use
+  // Clear marks for thunks that are still reachable from the last batch.
   for (; t < thunks.size(); t++)
     for (Symbol<E> *sym : thunks[t]->symbols)
       sym->flags = 0;
+
+  // Sort symbols for deterministic output.
+  tbb::parallel_for_each(thunks, [](std::unique_ptr<Thunk<E>> &thunk) {
+    ranges::sort(thunk->symbols, {}, [](Symbol<E> *sym) {
+      return std::tuple{sym->file->priority, sym->sym_idx};
+    });
+  });
 
   this->shdr.sh_size = offset;
 }
@@ -259,18 +266,23 @@ void remove_redundant_thunks(Context<E> &ctx) {
   for (OutputSection<E> *osec : sections) {
     tbb::parallel_for_each(osec->members, [&](InputSection<E> *isec) {
       for (const ElfRel<E> &rel : isec->get_rels(ctx))
-        if (requires_thunk(ctx, *isec, rel, false))
-          isec->file.symbols[rel.r_sym]->flags.test_and_set();
+        if (is_func_call_rel(rel))
+          if (Symbol<E> *sym = isec->file.symbols[rel.r_sym];
+              !sym->flags &&
+              requires_thunk(ctx, *isec, rel, false))
+            sym->flags.test_and_set();
     });
   }
 
   // Remove symbols from thunks if they don't actually need range
   // extension thunks
   for (OutputSection<E> *osec : sections) {
-    for (std::unique_ptr<Thunk<E>> &thunk : osec->thunks) {
-      std::erase_if(thunk->symbols, [&](Symbol<E> *sym) { return !sym->flags; });
+    tbb::parallel_for_each(osec->thunks,
+                           [&](std::unique_ptr<Thunk<E>> &thunk) {
+      std::erase_if(thunk->symbols,
+                    [&](Symbol<E> *sym) { return !sym->flags; });
       thunk->shrink_size(ctx);
-    }
+    });
   }
 
   // Recompute section sizes
@@ -294,12 +306,6 @@ void remove_redundant_thunks(Context<E> &ctx) {
     }
     osec->shdr.sh_size = offset;
   });
-
-  // Reset flags for future use
-  for (OutputSection<E> *osec : sections)
-    for (std::unique_ptr<Thunk<E>> &thunk : osec->thunks)
-      for (Symbol<E> *sym : thunk->symbols)
-        sym->flags = 0;
 }
 
 // When applying relocations, we want to know the address in a reachable
