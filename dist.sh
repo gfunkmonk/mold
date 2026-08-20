@@ -95,7 +95,7 @@ ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN sed -i -e '/^deb/d' -e 's/^# deb /deb /g' /etc/apt/sources.list && \
   echo 'Acquire::Retries "10"; Acquire::http::timeout "10"; Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
-  apt-get install -y --no-install-recommends wget file make gcc g++ zlib1g-dev libssl-dev ca-certificates && \
+  apt-get install -y --no-install-recommends wget file make gcc g++ git zlib1g-dev libssl-dev ca-certificates && \
   rm -rf /var/lib/apt/lists
 
 # Build CMake 3.27
@@ -110,11 +110,11 @@ RUN mkdir /build && \
 # Build GCC 14
 RUN mkdir /build && \
   cd /build && \
-  wget -O- --progress=dot:mega https://ftpmirror.gnu.org/gcc/gcc-14.2.0/gcc-14.2.0.tar.gz | tar xzf - --strip-components=1 && \
+  wget -O- --progress=dot:mega https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.gz | tar xzf - --strip-components=1 && \
   mkdir gmp mpc mpfr && \
-  wget -O- --progress=dot:mega https://ftpmirror.gnu.org/gmp/gmp-6.3.0.tar.gz | tar xzf - --strip-components=1 -C gmp && \
-  wget -O- --progress=dot:mega https://ftpmirror.gnu.org/mpc/mpc-1.3.1.tar.gz | tar xzf - --strip-components=1 -C mpc && \
-  wget -O- --progress=dot:mega https://ftpmirror.gnu.org/mpfr/mpfr-4.2.1.tar.gz | tar xzf - --strip-components=1 -C mpfr && \
+  wget -O- --progress=dot:mega https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.gz | tar xzf - --strip-components=1 -C gmp && \
+  wget -O- --progress=dot:mega https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz | tar xzf - --strip-components=1 -C mpc && \
+  wget -O- --progress=dot:mega https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.gz | tar xzf - --strip-components=1 -C mpfr && \
   ./configure --prefix=/usr --enable-languages=c,c++ --disable-bootstrap --disable-multilib && \
   make -j\$(nproc) && \
   make install && \
@@ -124,7 +124,7 @@ RUN mkdir /build && \
 # Build GNU binutils 2.43
 RUN mkdir /build && \
   cd /build && \
-  wget -O- --progress=dot:mega https://ftpmirror.gnu.org/binutils/binutils-2.43.tar.gz | tar xzf - --strip-components=1 && \
+  wget -O- --progress=dot:mega https://ftp.gnu.org/gnu/binutils/binutils-2.43.tar.gz | tar xzf - --strip-components=1 && \
   ./configure --prefix=/usr && \
   make -j\$(nproc) && \
   make install && \
@@ -163,7 +163,7 @@ ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN sed -i -e '/^deb/d' -e 's/^# deb /deb /g' /etc/apt/sources.list && \
   echo 'Acquire::Retries "10"; Acquire::http::timeout "10"; Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
-  apt-get install -y --no-install-recommends build-essential gcc-10 g++-10 clang-16 cmake && \
+  apt-get install -y --no-install-recommends build-essential gcc-10 g++-10 clang-16 cmake git && \
   ln -sf /usr/bin/clang-16 /usr/bin/clang && \
   ln -sf /usr/bin/clang++-16 /usr/bin/clang++ && \
   rm -rf /var/lib/apt/lists
@@ -176,7 +176,7 @@ ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 RUN sed -i -e '/^URIs/d' -e 's/^# http/URIs: http/' /etc/apt/sources.list.d/debian.sources && \
   echo 'Acquire::Retries "10"; Acquire::http::timeout "10"; Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
-  apt-get install -y --no-install-recommends build-essential gcc-14 g++-14 clang-18 cmake && \
+  apt-get install -y --no-install-recommends build-essential gcc-14 g++-14 clang-18 cmake git && \
   ln -sf /usr/bin/clang-18 /usr/bin/clang && \
   ln -sf /usr/bin/clang++-18 /usr/bin/clang++ && \
   rm -rf /var/lib/apt/lists
@@ -186,10 +186,10 @@ loongarch64)
   cat <<EOF | $image_build
 FROM mirror.gcr.io/loongarch64/debian:sid@sha256:0356df4e494bbb86bb469377a00789a5b42bbf67d5ff649a3f9721b745cbef77
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
-RUN sed -i -e 's!http[^ ]*!http://snapshot.debian.org/archive/debian-ports/20250620T014755Z!g' /etc/apt/sources.list && \
+RUN echo 'deb http://deb.debian.org/debian sid main' > /etc/apt/sources.list && \
   echo 'Acquire::Retries "10"; Acquire::http::timeout "10"; Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
-  apt-get install -y --no-install-recommends build-essential gcc-14 g++-14 clang-19 cmake && \
+  apt-get install -y --no-install-recommends build-essential gcc-14 g++-14 clang-19 cmake git && \
   ln -sf /usr/bin/clang-19 /usr/bin/clang && \
   ln -sf /usr/bin/clang++-19 /usr/bin/clang++ && \
   rm -rf /var/lib/apt/lists

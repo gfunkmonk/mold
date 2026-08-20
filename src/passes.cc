@@ -4,9 +4,9 @@
 #include <blake3.h>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <regex>
-#include <shared_mutex>
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_sort.h>
@@ -391,8 +391,12 @@ static void parse_input_sections(Context<E> &ctx) {
     if (file->is_reachable)
       for (ComdatGroupRef<E> &ref : file->comdat_groups)
         for (u32 i : ref.members(*file))
-          if (InputSection<E> *isec = file->sections[i])
-            isec->is_alive = ref.is_owner;
+          if (InputSection<E> *isec = file->sections[i]) {
+            if (ref.is_owner)
+              isec->flags |= InputSection<E>::IS_ALIVE;
+            else
+              isec->kill();
+          }
   });
 }
 
@@ -619,7 +623,7 @@ get_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
     ".text.", ".data.rel.ro.", ".data.", ".rodata.", ".bss.rel.ro.", ".bss.",
     ".init_array.", ".fini_array.", ".tbss.", ".tdata.", ".gcc_except_table.",
     ".ctors.", ".dtors.", ".gnu.warning.", ".openbsd.randomdata.",
-    ".sdata.", ".sbss.", ".srodata", ".gnu.build.attributes.",
+    ".sdata.", ".sbss.", ".srodata.", ".gnu.build.attributes.",
   };
 
   for (std::string_view prefix : prefixes) {
@@ -694,19 +698,20 @@ void create_output_sections(Context<E> &ctx) {
 
   using MapType = std::unordered_map<OutputSectionKey, OutputSection<E> *,
                                      OutputSectionKey::Hash>;
+
   MapType map;
-  std::shared_mutex mu;
+  std::mutex mu;
   bool ctors_in_init_array = has_ctors_and_init_array(ctx);
   tbb::enumerable_thread_specific<MapType> caches;
 
-  // Instantiate output sections
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+  // Instantiate output sections and assign input sections to them
+  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     // Make a per-thread cache of the main map to avoid lock contention.
     // It makes a noticeable difference if we have millions of input sections.
     MapType &cache = caches.local();
 
-    for (InputSection<E> *isec : file->sections) {
-      if (!isec || !isec->is_alive)
+    for (InputSection<E> *isec : ctx.objs[i]->sections) {
+      if (!isec || !isec->is_alive())
         continue;
 
       const ElfShdr<E> &shdr = isec->shdr();
@@ -715,9 +720,12 @@ void create_output_sections(Context<E> &ctx) {
 
       if (ctx.arg.relocatable && (sh_flags & SHF_GROUP)) {
         OutputSection<E> *osec =
-          new OutputSection<E>(isec->name(), shdr.sh_type);
+          ctx.arena.template make<OutputSection<E>>(isec->name(), shdr.sh_type);
         osec->sh_flags = sh_flags;
+        osec->members_vec.push_back({isec});
         isec->output_section = osec;
+
+        std::scoped_lock lock(mu);
         ctx.osec_pool.emplace_back(osec);
         continue;
       }
@@ -729,22 +737,17 @@ void create_output_sections(Context<E> &ctx) {
         if (auto it = cache.find(key); it != cache.end())
           return it->second;
 
-        {
-          std::shared_lock lock(mu);
-          if (auto it = map.find(key); it != map.end()) {
-            cache.insert({key, it->second});
-            return it->second;
-          }
+        std::scoped_lock lock(mu);
+        auto [it, inserted] = map.insert({key, nullptr});
+
+        if (inserted) {
+          OutputSection<E> *osec =
+            ctx.arena.template make<OutputSection<E>>(key.name, key.type);
+          osec->members_vec.resize(ctx.objs.size());
+          ctx.osec_pool.emplace_back(osec);
+          it->second = osec;
         }
 
-        std::unique_ptr<OutputSection<E>> osec =
-          std::make_unique<OutputSection<E>>(key.name, key.type);
-
-        std::unique_lock lock(mu);
-        auto [it, inserted] = map.insert({key, osec.get()});
-
-        if (inserted)
-          ctx.osec_pool.emplace_back(std::move(osec));
         cache.insert({key, it->second});
         return it->second;
       };
@@ -754,42 +757,47 @@ void create_output_sections(Context<E> &ctx) {
       if ((osec->sh_flags & sh_flags) != sh_flags)
         osec->sh_flags |= sh_flags;
       isec->output_section = osec;
+      osec->members_vec[i].push_back(isec);
     }
   });
 
-  // Add input sections to output sections
-  for (std::unique_ptr<OutputSection<E>> &osec : ctx.osec_pool)
-    osec->members_vec.resize(ctx.objs.size());
-
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    for (InputSection<E> *isec : ctx.objs[i]->sections)
-      if (isec && isec->output_section)
-        isec->output_section->members_vec[i].push_back(isec);
-  });
-
   // Compute section alignment
-  for (std::unique_ptr<OutputSection<E>> &osec : ctx.osec_pool) {
+  tbb::parallel_for_each(ctx.osec_pool, [](ArenaObjectPtr<OutputSection<E>> &osec) {
     Atomic<u32> p2align;
-    tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
+    tbb::parallel_for((i64)0, (i64)osec->members_vec.size(), [&](i64 i) {
       u32 x = 0;
       for (InputSection<E> *isec : osec->members_vec[i])
         x = std::max<u32>(x, isec->p2align);
       update_maximum(p2align, x);
     });
     osec->shdr.sh_addralign = 1 << p2align;
-  }
+  });
 
-  for (std::unique_ptr<OutputSection<E>> &osec : ctx.osec_pool) {
+  // Flatten members_vec into an arena-allocated members array
+  for (ArenaObjectPtr<OutputSection<E>> &osec : ctx.osec_pool) {
     osec->shdr.sh_flags = osec->sh_flags;
     osec->is_relro = is_relro(*osec);
-    osec->members = flatten(osec->members_vec);
+
+    i64 n = 0;
+    for (std::vector<InputSection<E> *> &vec : osec->members_vec)
+      n += vec.size();
+
+    ArenaPtr<InputSection<E>> *array =
+      ctx.arena.template allocate<ArenaPtr<InputSection<E>>>(n);
+
+    i64 idx = 0;
+    for (std::vector<InputSection<E> *> &vec : osec->members_vec)
+      for (InputSection<E> *isec : vec)
+        std::construct_at(array + idx++, isec);
+
+    osec->members = {array, (size_t)n};
     osec->members_vec.clear();
     osec->members_vec.shrink_to_fit();
   }
 
   // Add output sections and mergeable sections to ctx.chunks
   std::vector<Chunk<E> *> chunks;
-  for (std::unique_ptr<OutputSection<E>> &osec : ctx.osec_pool)
+  for (ArenaObjectPtr<OutputSection<E>> &osec : ctx.osec_pool)
     chunks.push_back(osec.get());
   for (ArenaObjectPtr<MergedSection<E>> &osec : ctx.merged_sections)
     chunks.push_back(osec.get());
@@ -1187,7 +1195,7 @@ void check_duplicate_symbols(Context<E> &ctx) {
       // section has been eliminated due to comdat deduplication.
       if (!esym.is_abs()) {
         InputSection<E> *isec = file->get_section(esym);
-        if (!isec || !isec->is_alive)
+        if (!isec || !isec->is_alive())
           continue;
       }
 
@@ -1259,7 +1267,7 @@ void convert_zero_to_bss(Context<E> &ctx) {
       return;
 
     for (InputSection<E> *isec : file->sections) {
-      if (!isec || !isec->is_alive)
+      if (!isec || !isec->is_alive())
         continue;
 
       std::string_view contents = isec->get_contents();
@@ -1419,9 +1427,9 @@ static i64 get_ctor_dtor_priority(InputSection<E> *isec) {
   // crtbegin.o and crtend.o contain marker symbols such as
   // __CTOR_LIST__ or __DTOR_LIST__. So they have to be at the
   // beginning or end of the section.
-  if (std::regex_search(isec->file.filename, re1))
+  if (std::regex_search(isec->file->filename, re1))
     return -2;
-  if (std::regex_search(isec->file.filename, re2))
+  if (std::regex_search(isec->file->filename, re2))
     return 65536;
 
   std::string_view name = isec->name();
@@ -1596,7 +1604,7 @@ void sort_debug_info_sections(Context<E> &ctx) {
   // Read each input file's .debug_info to record whether the file contains
   // DWARF32 or DWARF64
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->is_dwarf32 = is_dwarf32(ctx, file->debug_info);
+    file->is_dwarf32 = is_dwarf32(ctx, (InputSection<E> *)file->debug_info);
   });
 
   // Unless we have a mix of DWARF32 and DWARF64, it doesn't make sense to
@@ -1606,20 +1614,26 @@ void sort_debug_info_sections(Context<E> &ctx) {
     return;
 
   // Reorder input sections in the output section so that DWARF32
-  // precededs DWARF64
+  // precededs DWARF64.
   tbb::parallel_for_each(vec1, [&](OutputSection<E> *osec) {
-    ranges::stable_partition(osec->members, [](InputSection<E> *isec) {
-      return isec->file.is_dwarf32;
+    // We can't partition osec->members in place because stable_partition
+    // may move elements to a heap-allocated temporary buffer, and an
+    // ArenaPtr cannot live more than 8 GiB away from its target.
+    std::vector<InputSection<E> *> vec(osec->members.begin(), osec->members.end());
+    ranges::stable_partition(vec, [](InputSection<E> *isec) {
+      return isec->file->is_dwarf32;
     });
+    for (i64 i = 0; i < vec.size(); i++)
+      osec->members[i] = vec[i];
     osec->compute_section_size(ctx);
   });
 
   // Reorder strings in .debug_str and the like
   tbb::parallel_for_each(vec2, [&](MergedSection<E> *osec) {
     tbb::parallel_for_each(osec->members, [&](MergeableSection<E> *m) {
-      if (m->input_section->file.is_dwarf32)
-        for (SectionFragment<E> *frag : m->fragments)
-          frag->is_32bit = true;
+      if (m->input_section->file->is_dwarf32)
+        for (u32 idx : m->fragments)
+          m->parent.map.entries[idx].value.is_32bit = true;
     });
   });
 
@@ -1670,7 +1684,7 @@ void fixup_ctors_in_init_array(Context<E> &ctx) {
 }
 
 template <typename E>
-static void shuffle(std::vector<InputSection<E> *> &vec, u64 seed) {
+static void shuffle(std::span<ArenaPtr<InputSection<E>>> vec, u64 seed) {
   if (vec.empty())
     return;
 
@@ -1692,7 +1706,7 @@ static void shuffle(std::vector<InputSection<E> *> &vec, u64 seed) {
   //
   // We are not using std::uniform_int_distribution for the same reason.
   for (i64 i = 0; i < vec.size() - 1; i++)
-    std::swap(vec[i], vec[i + rand() % (vec.size() - i)]);
+    ranges::swap(vec[i], vec[i + rand() % (vec.size() - i)]);
 }
 
 template <typename E>
@@ -1883,6 +1897,9 @@ void scan_relocations(Context<E> &ctx) {
     file->scan_relocations(ctx);
   });
 
+  // Exit if there was a relocation that refers an undefined symbol.
+  ctx.checkpoint();
+
   // Word-size absolute relocations (e.g. R_X86_64_64) are handled
   // separately because they can be promoted to dynamic relocations.
   tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
@@ -1891,7 +1908,7 @@ void scan_relocations(Context<E> &ctx) {
         osec->scan_abs_relocations(ctx);
   });
 
-  // Exit if there was a relocation that refers an undefined symbol.
+  // Exit if the absolute-relocation pass reported an error.
   ctx.checkpoint();
 
   // Aggregate dynamic symbols to a single vector.
@@ -1909,14 +1926,14 @@ void scan_relocations(Context<E> &ctx) {
   });
 
   std::vector<Symbol<E> *> syms = flatten(vec);
-  ctx.symbol_aux.reserve(syms.size());
 
   if (ctx.needs_tlsld)
     ctx.got->add_tlsld(ctx);
 
   // Assign offsets in additional tables for each dynamic symbol.
   for (Symbol<E> *sym : syms) {
-    sym->add_aux(ctx);
+    if (!sym->aux)
+      sym->aux = ctx.arena.template make<SymbolAux<E>>();
 
     if (sym->is_imported || sym->is_exported)
       ctx.dynsym->add_symbol(ctx, sym);
@@ -2135,12 +2152,12 @@ void sort_dynsyms(Context<E> &ctx) {
     u32 num_buckets = num_exported / ctx.gnu_hash->LOAD_FACTOR + 1;
 
     tbb::parallel_for_each(exported_syms, [&](Symbol<E> *sym) {
-      sym->set_djb_hash(ctx, djb_hash(sym->name()));
+      sym->aux->djb_hash = djb_hash(sym->name());
     });
 
     tbb::parallel_sort(exported_syms, [&](Symbol<E> *a, Symbol<E> *b) {
-      return std::tuple(a->get_djb_hash(ctx) % num_buckets, a->name()) <
-             std::tuple(b->get_djb_hash(ctx) % num_buckets, b->name());
+      return std::tuple(a->aux->djb_hash % num_buckets, a->name()) <
+             std::tuple(b->aux->djb_hash % num_buckets, b->name());
     });
 
     ctx.gnu_hash->num_buckets = num_buckets;
@@ -2152,7 +2169,7 @@ void sort_dynsyms(Context<E> &ctx) {
 
   tbb::enumerable_thread_specific<i64> size;
   tbb::parallel_for((i64)1, (i64)syms.size(), [&](i64 i) {
-    syms[i]->set_dynsym_idx(ctx, i);
+    syms[i]->aux->dynsym_idx = i;
     size.local() += syms[i]->name().size() + 1;
   });
 
@@ -2517,32 +2534,32 @@ void compute_address_significance(Context<E> &ctx) {
       while (p != end) {
         Symbol<E> *sym = file->symbols[read_uleb(&p)];
         if (InputSection<E> *isec = sym->get_input_section())
-          isec->address_taken = true;
+          isec->set_address_taken();
       }
       return;
     }
 
     // Otherwise, infer address significance.
     for (InputSection<E> *isec : file->sections) {
-      if (!isec || !isec->is_alive || !(isec->shdr().sh_flags & SHF_ALLOC))
+      if (!isec || !isec->is_alive() || !(isec->shdr().sh_flags & SHF_ALLOC))
         continue;
 
       if (!(isec->shdr().sh_flags & SHF_EXECINSTR))
-        isec->address_taken = true;
+        isec->set_address_taken();
 
       for (const ElfRel<E> &r : isec->get_rels(ctx))
         if (!is_func_call_rel(r))
           if (Symbol<E> *sym = file->symbols[r.r_sym];
               InputSection<E> *dst = sym->get_input_section())
             if (dst->shdr().sh_flags & SHF_EXECINSTR)
-              dst->address_taken = true;
+              dst->set_address_taken();
     }
   });
 
   auto mark = [](Symbol<E> *sym) {
     if (sym)
       if (InputSection<E> *isec = sym->get_input_section())
-        isec->address_taken = true;
+        isec->set_address_taken();
   };
 
   // Some symbols' pointer values are leaked to the dynamic section.
@@ -3107,13 +3124,11 @@ i64 set_osec_offsets(Context<E> &ctx) {
     else
       set_virtual_addresses_by_order(ctx);
 
-    if (ctx.arg.pack_dyn_relocs_relr || ctx.arg.pack_dyn_relocs_android) {
+    if (ctx.arg.pack_dyn_relocs_android) {
       i64 x = ctx.reldyn->shdr.sh_size;
-      i64 y = ctx.relrdyn ? (i64)ctx.relrdyn->shdr.sh_size : 0;
       ctx.reldyn->update_shdr(ctx);
 
-      if (x != (i64)ctx.reldyn->shdr.sh_size ||
-          y != (ctx.relrdyn ? (i64)ctx.relrdyn->shdr.sh_size : 0))
+      if (x != (i64)ctx.reldyn->shdr.sh_size)
         continue;
     }
 
@@ -3678,7 +3693,7 @@ void show_stats(Context<E> &ctx) {
     undefined += obj->symbols.size() - obj->first_global;
 
     for (InputSection<E> *sec : obj->sections) {
-      if (!sec || !sec->is_alive)
+      if (!sec || !sec->is_alive())
         continue;
 
       static Counter alloc("reloc_alloc");

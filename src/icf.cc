@@ -118,7 +118,7 @@ static bool is_eligible(Context<E> &ctx, InputSection<E> &isec) {
     return false;
 
   if (shdr.sh_flags & SHF_EXECINSTR)
-    return (ctx.arg.icf_all || !isec.address_taken) &&
+    return (ctx.arg.icf_all || !isec.is_address_taken()) &&
            name != ".init" && name != ".fini";
 
   // .gcc_except_table contains a compiler-generated table. Pointer
@@ -130,7 +130,7 @@ static bool is_eligible(Context<E> &ctx, InputSection<E> &isec) {
 
   bool is_readonly = !(shdr.sh_flags & SHF_WRITE);
   bool is_relro = name.starts_with(".data.rel.ro");
-  return (ctx.arg.ignore_data_address_equality || !isec.address_taken) &&
+  return (ctx.arg.ignore_data_address_equality || !isec.is_address_taken()) &&
          (is_readonly || is_relro);
 }
 
@@ -158,7 +158,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
       hash((u64)frag);
     } else if (!isec) {
       hash('3');
-    } else if (isec->icf_eligible) {
+    } else if (isec->icf_idx != -1) {
       hash('4');
     } else {
       hash('5');
@@ -169,23 +169,24 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
 
   hash_string(isec.get_contents());
   hash(isec.shdr().sh_flags);
-  hash(isec.get_fdes().size());
+  std::span<FdeRecord<E>> fdes = isec.get_fdes();
+  hash(fdes.size());
   hash(isec.get_rels(ctx).size());
 
-  for (FdeRecord<E> &fde : isec.get_fdes()) {
-    hash(isec.file.cies[fde.cie_idx].icf_idx);
+  for (FdeRecord<E> &fde : fdes) {
+    hash(isec.file->cies[fde.cie_idx].icf_idx);
 
     // Bytes 0 to 4 contain the length of this record, and
     // bytes 4 to 8 contain an offset to CIE.
-    hash_string(fde.get_contents(isec.file).substr(8));
+    hash_string(fde.get_contents(*isec.file).substr(8));
 
-    hash(fde.get_rels(isec.file).size());
+    hash(fde.get_rels(*isec.file).size());
 
-    for (const ElfRel<E> &rel : fde.get_rels(isec.file).subspan(1)) {
-      hash_symbol(*isec.file.symbols[rel.r_sym]);
+    for (const ElfRel<E> &rel : fde.get_rels(*isec.file).subspan(1)) {
+      hash_symbol(*isec.file->symbols[rel.r_sym]);
       hash(rel.r_type);
       hash(rel.r_offset - fde.input_offset);
-      hash(get_addend(isec.file.cies[fde.cie_idx].input_section, rel));
+      hash(get_addend(isec.file->cies[fde.cie_idx].input_section, rel));
     }
   }
 
@@ -193,7 +194,7 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
     hash(rel.r_offset);
     hash(rel.r_type);
     hash(get_addend(isec, rel));
-    hash_symbol(*isec.file.symbols[rel.r_sym]);
+    hash_symbol(*isec.file->symbols[rel.r_sym]);
   }
 
   Digest digest;
@@ -327,12 +328,16 @@ static std::vector<InputSection<E> *> gather_sections(Context<E> &ctx) {
 
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     for (InputSection<E> *isec : ctx.objs[i]->sections) {
-      if (!isec || !isec->is_alive)
+      if (!isec)
+        continue;
+
+      assert(isec->icf_idx == -1);
+      if (!isec->is_alive())
         continue;
 
       if (is_eligible(ctx, *isec)) {
         eligible++;
-        isec->icf_eligible = true;
+        isec->icf_idx = 0;
         indices[i + 1]++;
       } else {
         non_eligible++;
@@ -349,7 +354,7 @@ static std::vector<InputSection<E> *> gather_sections(Context<E> &ctx) {
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
     i64 idx = indices[i];
     for (InputSection<E> *isec : ctx.objs[i]->sections) {
-      if (isec && isec->is_alive && isec->icf_eligible) {
+      if (isec && isec->icf_idx != -1) {
         isec->icf_idx = idx;
         sections[idx++] = isec;
       }
@@ -396,19 +401,19 @@ static void gather_edges(Context<E> &ctx,
 
   tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
     InputSection<E> &isec = *sections[i];
-    assert(isec.icf_eligible);
+    assert(isec.icf_idx != -1);
 
     for (FdeRecord<E> &fde : isec.get_fdes())
-      for (const ElfRel<E> &rel : fde.get_rels(isec.file).subspan(1))
-        if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+      for (const ElfRel<E> &rel : fde.get_rels(*isec.file).subspan(1))
+        if (Symbol<E> &sym = *isec.file->symbols[rel.r_sym];
             InputSection<E> *isec = sym.get_input_section())
-          if (isec->icf_eligible)
+          if (isec->icf_idx != -1)
             edge_indices[i + 1]++;
 
     for (const ElfRel<E> &rel : isec.get_rels(ctx))
-      if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+      if (Symbol<E> &sym = *isec.file->symbols[rel.r_sym];
           InputSection<E> *isec = sym.get_input_section())
-        if (isec->icf_eligible)
+        if (isec->icf_idx != -1)
           edge_indices[i + 1]++;
   });
 
@@ -422,16 +427,16 @@ static void gather_edges(Context<E> &ctx,
     i64 idx = edge_indices[i];
 
     for (FdeRecord<E> &fde : isec.get_fdes())
-      for (const ElfRel<E> &rel : fde.get_rels(isec.file).subspan(1))
-        if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+      for (const ElfRel<E> &rel : fde.get_rels(*isec.file).subspan(1))
+        if (Symbol<E> &sym = *isec.file->symbols[rel.r_sym];
             InputSection<E> *isec = sym.get_input_section())
-          if (isec->icf_eligible)
+          if (isec->icf_idx != -1)
             edges[idx++] = isec->icf_idx;
 
     for (const ElfRel<E> &rel : isec.get_rels(ctx))
-      if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+      if (Symbol<E> &sym = *isec.file->symbols[rel.r_sym];
           InputSection<E> *isec = sym.get_input_section())
-        if (isec->icf_eligible)
+        if (isec->icf_idx != -1)
           edges[idx++] = isec->icf_idx;
   });
 }
@@ -440,7 +445,7 @@ static void gather_edges(Context<E> &ctx,
 // digest and the current digests of the vertices it refers to. A
 // vertex's digest after the nth round is therefore a hash of its
 // unfolding into a tree of depth n.
-static void propagate(std::span<Digest> cur, std::span<Digest> next,
+static void propagate(std::vector<Digest> &cur, std::vector<Digest> &next,
                       std::span<u32> edges, std::span<u32> edge_indices) {
   tbb::parallel_for((i64)0, (i64)cur.size(), [&](i64 i) {
     SipHash13_128 hasher(siphash_key);
@@ -450,12 +455,9 @@ static void propagate(std::span<Digest> cur, std::span<Digest> next,
     i64 end = edge_indices[i + 1];
     for (i64 j : edges.subspan(begin, end - begin))
       hasher.update(&cur[j], sizeof(Digest));
-
     hasher.finish(&next[i]);
   });
-
-  static Counter counter("icf_round");
-  counter++;
+  std::swap(cur, next);
 }
 
 template <typename E>
@@ -469,26 +471,26 @@ static i64 count_num_classes(std::span<Digest> digests,
     if (map.insert(digests[i], sections[i]))
       num_classes.local()++;
   });
+
+  static Counter counter("icf_round");
+  counter++;
   return num_classes.combine(std::plus());
 }
 
 template <typename E>
-static void print_icf_sections(Context<E> &ctx) {
-  tbb::concurrent_vector<InputSection<E> *> leaders;
+static void
+print_icf_sections(Context<E> &ctx, std::span<InputSection<E> *> sections) {
+  tbb::concurrent_vector<InputSection<E> *> leader_sections;
   tbb::concurrent_unordered_multimap<InputSection<E> *, InputSection<E> *> map;
 
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (InputSection<E> *isec : file->sections) {
-      if (isec && isec->is_alive && isec->leader) {
-        if (isec == isec->leader)
-          leaders.push_back(isec);
-        else
-          map.insert({isec->leader, isec});
-      }
-    }
+  tbb::parallel_for_each(sections, [&](InputSection<E> *isec) {
+    if (isec == isec->icf_leader)
+      leader_sections.push_back(isec);
+    else
+      map.insert({isec->icf_leader, isec});
   });
 
-  tbb::parallel_sort(leaders.begin(), leaders.end(),
+  tbb::parallel_sort(leader_sections.begin(), leader_sections.end(),
                      [](InputSection<E> *a, InputSection<E> *b) {
                        return a->get_priority() < b->get_priority();
                      });
@@ -507,7 +509,7 @@ static void print_icf_sections(Context<E> &ctx) {
 
   i64 saved_bytes = 0;
 
-  for (InputSection<E> *leader : leaders) {
+  for (InputSection<E> *leader : leader_sections) {
     auto [begin, end] = map.equal_range(leader);
     if (begin != end) {
       *out << "selected section " << *leader << '\n';
@@ -528,17 +530,13 @@ void icf_sections(Context<E> &ctx) {
     return;
 
   get_random_bytes(siphash_key, sizeof(siphash_key));
-
   uniquify_cies(ctx);
 
   // Prepare for the propagation rounds.
   std::vector<InputSection<E> *> sections = gather_sections(ctx);
 
-  // `digests` holds the current digest of each vertex; `scratch` is
-  // where a propagation round writes the next digests before the two
-  // vectors swap roles.
+  // `digests` holds the current digest of each vertex
   std::vector<Digest> digests = compute_digests<E>(ctx, sections);
-  std::vector<Digest> scratch(digests.size());
 
   std::vector<u32> edges;
   std::vector<u32> edge_indices;
@@ -565,10 +563,15 @@ void icf_sections(Context<E> &ctx) {
   {
     Timer t(ctx, "propagate");
     i64 num_classes = -1;
+    std::vector<Digest> scratch(digests.size());
 
     for (;;) {
+      // count_num_classes is as expensive as propagate, so we propagate
+      // a few times before counting the number of distinct groups.
       propagate(digests, scratch, edges, edge_indices);
-      std::swap(digests, scratch);
+      propagate(digests, scratch, edges, edge_indices);
+      propagate(digests, scratch, edges, edge_indices);
+
       i64 m = count_num_classes<E>(digests, sections, map);
       if (m == num_classes)
         break;
@@ -581,20 +584,19 @@ void icf_sections(Context<E> &ctx) {
   {
     Timer t(ctx, "group");
     tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
-      sections[i]->leader = map.find(digests[i]);
+      sections[i]->icf_leader = map.find(digests[i]);
     });
   }
 
   if (!ctx.arg.print_icf_sections.empty())
-    print_icf_sections(ctx);
+    print_icf_sections<E>(ctx, sections);
 
   // Update alignment of leaders.
   {
     Timer t(ctx, "update_alignment");
-    tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-      for (InputSection<E> *isec : file->sections)
-        if (isec && isec->is_alive && isec->icf_removed())
-          update_maximum(isec->leader->p2align, isec->p2align);
+    tbb::parallel_for_each(sections, [&](InputSection<E> *isec) {
+      if (isec != isec->icf_leader)
+        update_maximum(isec->icf_leader->p2align, isec->p2align);
     });
   }
 
@@ -604,12 +606,13 @@ void icf_sections(Context<E> &ctx) {
   {
     Timer t(ctx, "sweep");
     static Counter eliminated("icf_eliminated");
-    tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-      for (InputSection<E> *isec : file->sections) {
-        if (isec && isec->is_alive && isec->icf_removed()) {
-          isec->kill();
-          eliminated++;
-        }
+    tbb::parallel_for_each(sections, [&](InputSection<E> *isec) {
+      if (isec != isec->icf_leader) {
+        isec->set_icf_removed();
+        isec->kill();
+        eliminated++;
+      } else {
+        isec->offset = -1;
       }
     });
   }

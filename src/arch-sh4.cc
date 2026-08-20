@@ -152,32 +152,36 @@ template <>
 void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
   if (ctx.arg.pic) {
     constexpr U16<E> insn[] = {
-      0xd001, //    mov.l   1f, r0
+      0xd002, //    mov.l   1f, r0
       0x00ce, //    mov.l   @(r0, r12), r0
+      0xd102, //    mov.l   2f, r1
       0x402b, //    jmp     @r0
-      0xd101, //    mov.l   2f, r1
+      0x0009, //    nop
+      0x0009, //    nop
       0, 0,   // 1: .long GOTPLT_ENTRY
       0, 0,   // 2: .long INDEX_IN_RELPLT
     };
 
     static_assert(sizeof(insn) == E::plt_size);
     memcpy(buf, insn, sizeof(insn));
-    *(U32<E> *)(buf + 8) = sym.get_gotplt_addr(ctx) - ctx.got->shdr.sh_addr;
-    *(U32<E> *)(buf + 12) = sym.get_plt_idx(ctx) * sizeof(ElfRel<E>);
+    *(U32<E> *)(buf + 12) = sym.get_gotplt_addr(ctx) - ctx.got->shdr.sh_addr;
+    *(U32<E> *)(buf + 16) = sym.get_plt_idx(ctx) * sizeof(ElfRel<E>);
   } else {
     constexpr U16<E> insn[] = {
-      0xd001, //    mov.l   1f, r0
+      0xd002, //    mov.l   1f, r0
       0x6002, //    mov.l   @r0, r0
+      0xd102, //    mov.l   2f, r1
       0x402b, //    jmp     @r0
-      0xd101, //    mov.l   2f, r1
+      0x0009, //    nop
+      0x0009, //    nop
       0, 0,   // 1: .long GOTPLT_ENTRY
       0, 0,   // 2: .long INDEX_IN_RELPLT
     };
 
     static_assert(sizeof(insn) == E::plt_size);
     memcpy(buf, insn, sizeof(insn));
-    *(U32<E> *)(buf + 8) = sym.get_gotplt_addr(ctx);
-    *(U32<E> *)(buf + 12) = sym.get_plt_idx(ctx) * sizeof(ElfRel<E>);
+    *(U32<E> *)(buf + 12) = sym.get_gotplt_addr(ctx);
+    *(U32<E> *)(buf + 16) = sym.get_plt_idx(ctx) * sizeof(ElfRel<E>);
   }
 }
 
@@ -238,7 +242,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE)
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
+    if (sym.get_type() == STT_TLS && sym.is_remaining_undef_weak())
+      continue;
+
     u8 *loc = base + rel.r_offset;
 
     u64 S = sym.get_addr(ctx);
@@ -290,7 +297,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       return;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
     SectionFragment<E> *frag;
@@ -330,7 +337,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
 
     if (sym.is_ifunc())
       Error(ctx) << sym << ": GNU ifunc symbol is not supported on sh4";

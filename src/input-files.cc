@@ -481,12 +481,12 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
         // in an output file is just a waste of space.
         if (name == ".debug_gnu_pubnames") {
           debug_pubnames = isec;
-          isec->is_alive = false;
+          isec->kill();
         }
 
         if (name == ".debug_gnu_pubtypes") {
           debug_pubtypes = isec;
-          isec->is_alive = false;
+          isec->kill();
         }
 
         // .debug_types is similar to .debug_info but contains type info
@@ -524,6 +524,97 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       if (isec && isec->shdr().sh_type == SHT_ARM_EXIDX)
         if (InputSection<E> *target = sections[isec->shdr().sh_link])
           target->extra.exidx = isec;
+}
+
+// Initialize cie's fde_ptr_size member by parsing the augmentation
+// string. We need this member to remove FDE records referring to an
+// empty segment from the output .eh_frame_hdr.
+template <typename E>
+static void parse_fde_encoding(Context<E> &ctx, CieRecord<E> &cie) {
+  InputSection<E> &isec = cie.input_section;
+  std::string_view data = cie.get_contents();
+
+  // Returns the size in bytes of a value in the DWARF exception header
+  // encoding `enc`.
+  auto ptr_size = [&](u8 enc) -> i64 {
+    switch (enc & 0xf) {
+    case DW_EH_PE_absptr:
+      return sizeof(Word<E>);
+    case DW_EH_PE_udata4:
+    case DW_EH_PE_sdata4:
+      return 4;
+    case DW_EH_PE_udata8:
+    case DW_EH_PE_sdata8:
+      return 8;
+    }
+    Fatal(ctx) << isec << ": unsupported FDE pointer encoding: " << (int)enc;
+  };
+
+  // Skip the length, CIE ID and version fields
+  u8 version = data[8];
+  if (version != 1 && version != 3)
+    Fatal(ctx) << isec << ": unsupported CIE version: " << (int)version;
+  data.remove_prefix(9);
+
+  // Read the augmentation string
+  std::string_view aug = data.data();
+  data.remove_prefix(aug.size() + 1);
+
+  auto get_encoding = [&]() -> u8 {
+    // An empty augmentation string means FDE pointers are raw absolute
+    // addresses. A string not starting with 'z' denotes some legacy
+    // augmentation (e.g. "eh") whose layout we don't know.
+    if (aug.empty())
+      return DW_EH_PE_absptr;
+
+    if (aug[0] != 'z')
+      Fatal(ctx) << isec << ": unsupported CIE augmentation string: " << aug;
+
+    // ULEB128 and SLEB128 values have the same framing, so read_uleb
+    // skips both.
+    read_uleb(&data);    // code alignment factor
+    read_uleb(&data);    // data alignment factor
+    if (version == 1)    // return address register
+      data.remove_prefix(1);
+    else
+      read_uleb(&data);
+    read_uleb(&data);    // augmentation data length
+
+    // Walk the augmentation data, looking for 'R', whose data byte
+    // specifies how FDE pointers are encoded.
+    for (char c : aug.substr(1)) {
+      switch (c) {
+      case 'R':
+        return data[0];
+      case 'L':
+        // A byte specifying the LSDA pointer encoding
+        data.remove_prefix(1);
+        break;
+      case 'P':
+        // A byte specifying the personality function pointer encoding,
+        // followed by the pointer itself
+        data.remove_prefix(ptr_size(data[0]) + 1);
+        break;
+      case 'S':
+      case 'B':
+      case 'G':
+        // 'S' (signal frame), 'B' (AArch64 pointer authentication) and
+        // 'G' (AArch64 memory tagging) are not followed by data
+        break;
+      default:
+        Fatal(ctx) << isec << ": unsupported CIE augmentation string: " << aug;
+      }
+    }
+
+    // Without 'R', FDE pointers are raw absolute addresses.
+    return DW_EH_PE_absptr;
+  };
+
+  // We support only raw absolute and PC-relative pointers.
+  u8 enc = get_encoding();
+  if ((enc & 0xf0) != 0 && (enc & 0xf0) != DW_EH_PE_pcrel)
+    Fatal(ctx) << isec << ": unsupported FDE pointer encoding: " << (int)enc;
+  cie.fde_ptr_size = ptr_size(enc);
 }
 
 // .eh_frame contains data records explaining how to handle exceptions.
@@ -584,6 +675,7 @@ void ObjectFile<E>::parse_ehframe(Context<E> &ctx) {
       if (id == 0) {
         // This is CIE.
         cies.emplace_back(ctx, *this, *isec, begin_offset, rels, rel_begin);
+        parse_fde_encoding(ctx, cies.back());
       } else {
         // This is FDE.
         if (rel_begin == rel_idx || rels[rel_begin].r_sym == 0) {
@@ -617,7 +709,7 @@ void ObjectFile<E>::parse_ehframe(Context<E> &ctx) {
       fdes[i].cie_idx = find_cie(fdes[i].input_offset + 4 - cie_offset);
     }
 
-    isec->is_alive = false;
+    isec->kill();
   }
 
   auto get_isec = [&](const FdeRecord<E> &fde) {
@@ -632,17 +724,19 @@ void ObjectFile<E>::parse_ehframe(Context<E> &ctx) {
 
   // Associate FDEs to input sections.
   for (i64 i = 0; i < fdes.size();) {
-    InputSection<E> *isec = get_isec(fdes[i]);
+    i64 begin = i;
+    InputSection<E> *isec = get_isec(fdes[i++]);
     assert(isec->fde_begin == -1);
 
-    if (isec->is_alive) {
-      isec->fde_begin = i++;
-      while (i < fdes.size() && isec == get_isec(fdes[i]))
-        i++;
-      isec->fde_end = i;
-    } else {
-      fdes[i++].is_alive = false;
-    }
+    while (i < fdes.size() && isec == get_isec(fdes[i]))
+      i++;
+    fdes[i - 1].is_last = true;
+
+    if (isec->is_alive())
+      isec->fde_begin = begin;
+    else
+      for (i64 j = begin; j < i; j++)
+        fdes[j].is_alive = false;
   }
 }
 
@@ -684,7 +778,7 @@ void ObjectFile<E>::parse_sframe(Context<E> &ctx) requires supports_sframe<E> {
   for (InputSection<E> *isec : sframe_sections) {
     // The input section is consumed by the linker; it's not copied to the
     // output as-is but reconstructed into ctx.sframe.
-    isec->is_alive = false;
+    isec->kill();
 
     std::string_view data = this->get_string(ctx, isec->shdr());
     const SFrameHeader<E> &hdr = *(const SFrameHeader<E> *)data.data();
@@ -851,7 +945,7 @@ void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
   if constexpr (is_riscv<E> || is_loongarch<E>) {
     for (i64 i = 1; i < sections.size(); i++) {
       InputSection<E> *isec = sections[i];
-      if (!isec || !isec->is_alive || !(isec->shdr().sh_flags & SHF_ALLOC))
+      if (!isec || !isec->is_alive() || !(isec->shdr().sh_flags & SHF_ALLOC))
         continue;
 
       std::span<ElfRel<E>> rels = isec->get_rels(ctx);
@@ -1155,7 +1249,7 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
     InputSection<E> *isec = nullptr;
     if (!esym.is_abs() && !esym.is_common() && sections_parsed) {
       isec = get_section(esym);
-      if (!isec || !isec->is_alive)
+      if (!isec || !isec->is_alive())
         continue;
     }
 
@@ -1209,7 +1303,7 @@ template <typename E>
 void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
   // Scan relocations against seciton contents
   for (InputSection<E> *isec : sections)
-    if (isec && isec->is_alive && (isec->shdr().sh_flags & SHF_ALLOC))
+    if (isec && isec->is_alive() && (isec->shdr().sh_flags & SHF_ALLOC))
       isec->scan_relocations(ctx);
 
   // Scan relocations against exception frames
@@ -1326,7 +1420,7 @@ void ObjectFile<E>::compute_symtab_size(Context<E> &ctx) {
     if (SectionFragment<E> *frag = sym.get_frag())
       return frag->is_alive;
     if (InputSection<E> *isec = sym.get_input_section())
-      return isec->is_alive;
+      return isec->is_alive();
     return true;
   };
 

@@ -289,7 +289,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE || rel.r_type == R_ARM_V4BX)
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
+    if (sym.get_type() == STT_TLS && sym.is_remaining_undef_weak())
+      continue;
+
     u8 *loc = base + rel.r_offset;
 
     u64 S = sym.get_addr(ctx);
@@ -556,7 +559,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       return;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
     SectionFragment<E> *frag;
@@ -598,7 +601,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
 
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT;
@@ -723,7 +726,7 @@ void create_arm_exidx_section<E>(Context<E> &ctx) {
       ctx.chunk_pool.emplace_back(sec);
 
       for (InputSection<E> *isec : osec->members)
-        isec->is_alive = false;
+        isec->kill();
       break;
     }
   }
@@ -872,7 +875,7 @@ void arm32be_swap_bytes(Context<E> &ctx) {
 
     for (Symbol<E> *sym : file->get_local_syms())
       if (InputSection<E> *isec = sym->get_input_section())
-        if (isec->is_alive && (isec->shdr().sh_flags & SHF_EXECINSTR))
+        if (isec->is_alive() && (isec->shdr().sh_flags & SHF_EXECINSTR))
           if (std::string_view x = sym->name();
               x == "$a" || x.starts_with("$a.") ||
               x == "$t" || x.starts_with("$t.") ||

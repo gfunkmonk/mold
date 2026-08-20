@@ -76,6 +76,7 @@ Options:
   --Tbss=ADDR                 Set address to .bss
   --Tdata=ADDR                Set address to .data
   --Ttext=ADDR                Set address to .text
+  --Ttext-segment=ADDR        Set address of text segment
   --allow-multiple-definition Allow multiple definitions
   --apply-dynamic-relocs      Apply link-time values for dynamic relocations (default)
     --no-apply-dynamic-relocs
@@ -1154,6 +1155,8 @@ std::vector<ReaderJob> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.section_start[".data"] = parse_hex(ctx, "Tdata", arg);
     } else if (read_arg("Ttext")) {
       ctx.arg.section_start[".text"] = parse_hex(ctx, "Ttext", arg);
+    } else if (read_arg("Ttext-segment")) {
+      ctx.arg.ttext_segment = parse_number(ctx, "Ttext-segment", arg);
     } else if (read_flag("repro")) {
       ctx.arg.repro = true;
     } else if (read_z_flag("now")) {
@@ -1343,7 +1346,7 @@ std::vector<ReaderJob> parse_nonpositional_args(Context<E> &ctx) {
                                    std::string(arg));
     } else if (read_arg("opt-remarks-passes")) {
       ctx.arg.plugin_opt.push_back("opt-remarks-passes=" + std::string(arg));
-    } else if (read_flag("opt-remarks-with_hotness")) {
+    } else if (read_flag("opt-remarks-with-hotness")) {
       ctx.arg.plugin_opt.emplace_back("opt-remarks-with-hotness");
     } else if (args[0].starts_with("-lto-O")) {
       ctx.arg.plugin_opt.push_back("O" + std::string(args[0].substr(6)));
@@ -1580,8 +1583,14 @@ std::vector<ReaderJob> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.shared)
     ctx.arg.pic = true;
 
-  if (ctx.arg.pic)
+  if (ctx.arg.ttext_segment) {
+    u64 val = *ctx.arg.ttext_segment;
+    if (val % ctx.page_size)
+      Warn(ctx) << "-Ttext-segment is not a multiple of page size: " << val;
+    ctx.arg.image_base = align_down(val, ctx.page_size);
+  } else if (ctx.arg.pic) {
     ctx.arg.image_base = 0;
+  }
 
   // A shared library is loaded by the dynamic linker, so it doesn't need
   // PT_INTERP. (-pie makes the output an executable even with -shared.)

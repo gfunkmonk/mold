@@ -152,7 +152,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE)
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
+    if (sym.get_type() == STT_TLS && sym.is_remaining_undef_weak())
+      continue;
+
     u8 *loc = base + rel.r_offset;
 
     u64 S = sym.get_addr(ctx);
@@ -484,7 +487,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       return;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
     SectionFragment<E> *frag;
@@ -534,7 +537,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
     u8 *loc = contents + rel.r_offset;
 
     if (sym.is_ifunc())
@@ -666,7 +669,7 @@ void Thunk<E>::shrink_size(Context<E> &ctx) {
     u64 S = sym->get_addr(ctx);
     u64 P = get_addr() + off;
     i64 prel = page(S) - page(P);
-    off += is_small(prel) ? 16 : 32;
+    off += is_small(prel) ? 12 : 24;
     offsets.push_back(off);
   }
 }
@@ -678,7 +681,6 @@ void Thunk<E>::copy_buf(Context<E> &ctx) {
     0x9000'0010, // adrp x16, 0
     0x9100'0210, // add  x16, x16
     0xd61f'0200, // br   x16
-    0xd420'7d00, // brk
   };
 
   // Long thunk with a 64 bit displacement
@@ -689,8 +691,6 @@ void Thunk<E>::copy_buf(Context<E> &ctx) {
     0xf2e0'0011, // movk x17, 0, lsl #48
     0x8b11'0210, // add  x16, x16, x17
     0xd61f'0200, // br   x16
-    0xd420'7d00, // brk
-    0xd420'7d00, // brk
   };
 
   u8 *base = ctx.buf + output_section.shdr.sh_offset + offset;
@@ -700,7 +700,7 @@ void Thunk<E>::copy_buf(Context<E> &ctx) {
     u64 P = get_addr() + offsets[i];
     u8 *buf = base + offsets[i];
 
-    if (offsets[i + 1] - offsets[i] == 16) {
+    if (offsets[i + 1] - offsets[i] == sizeof(insn1)) {
       i64 prel = page(S) - page(P);
       assert(is_int(prel, 33));
       memcpy(buf, insn1, sizeof(insn1));

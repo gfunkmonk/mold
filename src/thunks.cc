@@ -11,14 +11,9 @@
 //
 // The function in this file creates thunks.
 //
-// Note that although thunks play an important role in an executable, they
-// don't take up too much space in it. For example, among the clang-16's
-// text segment whose size is ~300 MiB on ARM64, thunks in total occupy
-// only ~30 KiB or 0.01%. Of course the number depends on an ISA; we would
-// need more thunks on ARM32 whose branch range is shorter than ARM64.
-// That said, the total size of thunks still isn't that much. Therefore,
-// we don't need to try too hard to reduce thunk size to the absolute
-// minimum.
+// Thunk size varies widely across programs. In an ARM64 build of Clang 16,
+// thunks occupy about 30 KiB (0.01%) of a ~300 MiB text section, compared
+// with about 12.5 MiB (2.5%) of a ~500 MiB text section in TensorFlow.
 
 #if MOLD_ARM32LE || MOLD_ARM32BE || MOLD_ARM64LE || MOLD_ARM64BE || \
     MOLD_PPC32 || MOLD_PPC64V1 || MOLD_PPC64V2
@@ -41,10 +36,9 @@ static constexpr i64 batch_size =
 // for ARM64/ARM32/PPC, respectively.
 static constexpr i64 max_thunk_size = batch_size / 2;
 
-// We align thunks to 16 byte boundaries because many processor vendors
-// recommend we align branch targets to 16 byte boundaries for performance
-// reasons.
-static constexpr i64 thunk_align = 16;
+// Power10 prefixed instructions must not cross a 64-byte boundary.
+// Aligning each thunk group to a 8-byte boundary guarantees that.
+static constexpr i64 thunk_align = 8;
 
 template <typename E>
 static bool
@@ -52,7 +46,7 @@ requires_thunk(Context<E> &ctx, InputSection<E> &isec, const ElfRel<E> &rel,
                bool first_pass) {
   if (!is_func_call_rel(rel))
     return false;
-  Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+  Symbol<E> &sym = *isec.file->symbols[rel.r_sym];
 
   if (first_pass) {
     // On the first pass, we pessimistically assume that all out-of-section
@@ -115,7 +109,7 @@ void Thunk<E>::compute_size() {
 
 template <>
 void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
-  std::span<InputSection<E> *> m = members;
+  std::span<ArenaPtr<InputSection<E>>> m = members;
   if (m.empty())
     return;
 
@@ -172,7 +166,7 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
 
     // Find the end of the current batch. Section end addresses are sorted,
     // so use binary search. Starting from B + 1 guarantees progress.
-    std::span<InputSection<E> *> range = m.subspan(b + 1, d - b - 1);
+    std::span<ArenaPtr<InputSection<E>>> range = m.subspan(b + 1, d - b - 1);
     c = ranges::lower_bound(range, m[b]->offset + batch_size, {},
                             [](InputSection<E> *isec) {
                               return isec->offset + isec->sh_size;
@@ -204,7 +198,7 @@ void OutputSection<E>::create_range_extension_thunks(Context<E> &ctx) {
       InputSection<E> &isec = *m[i];
       for (const ElfRel<E> &rel : isec.get_rels(ctx))
         if (requires_thunk(ctx, isec, rel, true))
-          if (Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+          if (Symbol<E> &sym = *isec.file->symbols[rel.r_sym];
               !sym.flags.test_and_set())
             symbols.local().push_back(&sym);
     });
@@ -267,7 +261,7 @@ void remove_redundant_thunks(Context<E> &ctx) {
     tbb::parallel_for_each(osec->members, [&](InputSection<E> *isec) {
       for (const ElfRel<E> &rel : isec->get_rels(ctx))
         if (is_func_call_rel(rel))
-          if (Symbol<E> *sym = isec->file.symbols[rel.r_sym];
+          if (Symbol<E> *sym = isec->file->symbols[rel.r_sym];
               !sym->flags &&
               requires_thunk(ctx, *isec, rel, false))
             sym->flags.test_and_set();
@@ -287,7 +281,7 @@ void remove_redundant_thunks(Context<E> &ctx) {
 
   // Recompute section sizes
   tbb::parallel_for_each(sections, [&](OutputSection<E> *osec) {
-    std::span<InputSection<E> *> m = osec->members;
+    std::span<ArenaPtr<InputSection<E>>> m = osec->members;
     std::span<std::unique_ptr<Thunk<E>>> t = osec->thunks;
     i64 offset = 0;
 

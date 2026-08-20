@@ -161,7 +161,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE)
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
+    if (sym.get_type() == STT_TLS && sym.is_remaining_undef_weak())
+      continue;
+
     u8 *loc = base + rel.r_offset;
 
     u64 S = sym.get_addr(ctx);
@@ -289,7 +292,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       return;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
     SectionFragment<E> *frag;
@@ -335,7 +338,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
-    Symbol<E> &sym = *file.symbols[rel.r_sym];
+    Symbol<E> &sym = *file->symbols[rel.r_sym];
 
     if (sym.is_ifunc())
       sym.flags |= NEEDS_GOT | NEEDS_PLT | NEEDS_PPC_OPD;
@@ -560,7 +563,7 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
     InputSection<E> *opd = get_opd_section(*file);
     if (!opd)
       return;
-    opd->is_alive = false;
+    opd->kill();
 
     // Move symbols from .opd to .text.
     std::vector<OpdSymbol> opd_syms;
@@ -592,7 +595,7 @@ void ppc64v1_rewrite_opd(Context<E> &ctx) {
 
     // Rewrite relocations so that they directly refer to .opd.
     for (InputSection<E> *isec : file->sections) {
-      if (!isec || !isec->is_alive || isec == opd)
+      if (!isec || !isec->is_alive() || isec == opd)
         continue;
 
       for (ElfRel<E> &r : isec->get_rels(ctx)) {
@@ -634,7 +637,7 @@ void ppc64v1_scan_symbols(Context<E> &ctx) {
 }
 
 void PPC64OpdSection::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_opd_idx(ctx, symbols.size());
+  sym->aux->opd_idx = symbols.size();
   symbols.push_back(sym);
   this->shdr.sh_size += ENTRY_SIZE;
 }
@@ -650,7 +653,7 @@ std::vector<u64> PPC64OpdSection::get_relr_offsets(Context<E> &ctx) {
   std::vector<u64> offsets;
   offsets.reserve(symbols.size() * 2);
   for (Symbol<E> *sym : symbols) {
-    u64 loc = sym->get_opd_addr(ctx);
+    u64 loc = sym->get_opd_addr(ctx) - this->shdr.sh_addr;
     offsets.push_back(loc);
     offsets.push_back(loc + 8);
   }
@@ -663,9 +666,11 @@ void PPC64OpdSection::write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const {
 
   for (Symbol<E> *sym : symbols) {
     u64 loc = sym->get_opd_addr(ctx);
-    if (!ctx.arg.pack_dyn_relocs_relr || loc % sizeof(Word<E>) != 0)
+    if (!ctx.arg.pack_dyn_relocs_relr || !this->num_relrs ||
+        loc % sizeof(Word<E>) != 0)
       *buf++ = ElfRel<E>(loc, E::R_RELATIVE, 0, sym->get_addr(ctx, NO_PLT | NO_OPD));
-    if (!ctx.arg.pack_dyn_relocs_relr || (loc + 8) % sizeof(Word<E>) != 0)
+    if (!ctx.arg.pack_dyn_relocs_relr || !this->num_relrs ||
+        (loc + 8) % sizeof(Word<E>) != 0)
       *buf++ = ElfRel<E>(loc + 8, E::R_RELATIVE, 0, ctx.extra.TOC->value);
   }
 }

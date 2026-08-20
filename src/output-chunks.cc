@@ -85,6 +85,8 @@ void OutputEhdr<E>::copy_buf(Context<E> &ctx) {
 
   if (ctx.arg.relocatable)
     hdr.e_type = ET_REL;
+  else if (ctx.arg.pie && ctx.arg.ttext_segment)
+    hdr.e_type = ET_EXEC;
   else if (ctx.arg.pic)
     hdr.e_type = ET_DYN;
   else
@@ -423,32 +425,52 @@ void RelDynSection<E>::write_relocs(Context<E> &ctx, ElfRel<E> *buf) {
 }
 
 template <typename E>
-void RelDynSection<E>::update_shdr(Context<E> &ctx) {
-  i64 num_relocs = 0;
-  for (Chunk<E> *chunk : ctx.chunks) {
+void RelDynSection<E>::construct_relr(Context<E> &ctx) {
+  assert(ctx.arg.pack_dyn_relocs_relr);
+
+  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
     chunk->num_dynrels = chunk->get_num_dynrels(ctx);
     chunk->num_relrs = 0;
-    num_relocs += chunk->num_dynrels;
+
+    // Do not use RELR for executable chunks, as they don't usually contain
+    // base relocations.
+    if (chunk->shdr.sh_flags & SHF_EXECINSTR)
+      return;
+
+    // --section-start can override a chunk's alignment. Conservatively use
+    // .rel[a].dyn if the explicitly assigned address is not word-aligned.
+    if (auto it = ctx.arg.section_start.find(chunk->name);
+        it != ctx.arg.section_start.end() &&
+        it->second % sizeof(Word<E>) != 0)
+      return;
+
+    if (chunk->num_dynrels) {
+      std::vector<u64> offsets = chunk->get_relr_offsets(ctx);
+      chunk->num_relrs = offsets.size();
+      assert(chunk->num_relrs <= chunk->num_dynrels);
+      chunk->relr = encode_relr<E>(offsets);
+    }
+  });
+  i64 size = 0;
+  for (Chunk<E> *chunk : ctx.chunks)
+    size += chunk->relr.size() * sizeof(Word<E>);
+  ctx.relrdyn->shdr.sh_size = size;
+}
+
+template <typename E>
+void RelDynSection<E>::update_shdr(Context<E> &ctx) {
+  if (!ctx.arg.pack_dyn_relocs_relr) {
+    tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+      chunk->num_dynrels = chunk->get_num_dynrels(ctx);
+      chunk->num_relrs = 0;
+    });
   }
 
+  i64 num_relocs = 0;
   i64 num_relrs = 0;
-  if (ctx.arg.pack_dyn_relocs_relr) {
-    std::vector<u64> offsets;
-    offsets.reserve(num_relocs);
-
-    for (Chunk<E> *chunk : ctx.chunks) {
-      if (chunk->num_dynrels) {
-        std::vector<u64> vec = chunk->get_relr_offsets(ctx);
-        chunk->num_relrs = vec.size();
-        assert(chunk->num_relrs <= chunk->num_dynrels);
-        append(offsets, vec);
-      }
-    }
-
-    ranges::sort(offsets);
-    num_relrs = offsets.size();
-    ctx.relrdyn->relocs = encode_relr<E>(offsets);
-    ctx.relrdyn->shdr.sh_size = ctx.relrdyn->relocs.size() * sizeof(Word<E>);
+  for (Chunk<E> *chunk : ctx.chunks) {
+    num_relocs += chunk->num_dynrels;
+    num_relrs += chunk->num_relrs;
   }
 
   if (ctx.arg.pack_dyn_relocs_android) {
@@ -482,8 +504,10 @@ void RelDynSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 void RelrDynSection<E>::copy_buf(Context<E> &ctx) {
   Word<E> *buf = (Word<E> *)(ctx.buf + this->shdr.sh_offset);
-  for (u64 val : relocs)
-    *buf++ = val;
+
+  for (Chunk<E> *chunk : ctx.chunks)
+    for (u64 val : chunk->relr)
+      *buf++ = (val & 1) ? val : chunk->shdr.sh_addr + val;
 }
 
 template <typename E>
@@ -923,7 +947,7 @@ void OutputSection<E>::compute_section_size(Context<E> &ctx) {
   // we first split input sections into groups and assign offsets to
   // groups.
   struct Group {
-    std::span<InputSection<E> *> members;
+    std::span<ArenaPtr<InputSection<E>>> members;
     i64 size = 0;
     i64 offset = 0;
     i64 align = 1;
@@ -932,7 +956,7 @@ void OutputSection<E>::compute_section_size(Context<E> &ctx) {
   std::vector<Group> groups;
   constexpr i64 group_size = 10000;
 
-  for (std::span<InputSection<E> *> m = members; !m.empty();) {
+  for (std::span<ArenaPtr<InputSection<E>>> m = members; !m.empty();) {
     i64 sz = std::min<i64>(group_size, m.size());
     groups.push_back({m.subspan(0, sz)});
     m = m.subspan(sz);
@@ -997,6 +1021,7 @@ void OutputSection<E>::copy_buf(Context<E> &ctx) {
 
     switch (r.kind) {
     case ABS_REL_NONE:
+    case ABS_REL_RELR:
       *(Word<E> *)loc = S + A;
       break;
     case ABS_REL_BASEREL:
@@ -1029,16 +1054,15 @@ std::vector<u64> OutputSection<E>::get_relr_offsets(Context<E> &) {
   offsets.reserve(this->num_dynrels);
 
   auto scan = [&](i64 begin, i64 end, std::vector<u64> &out) {
-    for (const AbsRel<E> &r : std::span(abs_rels).subspan(begin, end - begin)) {
+    for (AbsRel<E> &r : std::span(abs_rels).subspan(begin, end - begin)) {
       if (r.kind != ABS_REL_BASEREL)
         continue;
 
-      u64 P = this->shdr.sh_addr + r.isec->offset + r.offset;
-      if constexpr (is_riscv<E> || is_loongarch<E>)
-        P -= get_r_delta(*r.isec, r.offset);
-
-      if (P % sizeof(Word<E>) == 0)
-        out.push_back(P);
+      if (r.isec->shdr().sh_addralign % sizeof(Word<E>) == 0 &&
+          r.offset % sizeof(Word<E>) == 0) {
+        r.kind = ABS_REL_RELR;
+        out.push_back(r.isec->offset + r.offset);
+      }
     }
   };
 
@@ -1070,7 +1094,7 @@ void OutputSection<E>::write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const {
   i64 nshards = dynrel_offsets.size() - 1;
   std::vector<i64> offsets = dynrel_offsets;
 
-  if (ctx.arg.pack_dyn_relocs_relr) {
+  if (ctx.arg.pack_dyn_relocs_relr && this->num_relrs) {
     assert(relr_offsets.size() == offsets.size());
     for (i64 i = 0; i <= nshards; i++)
       offsets[i] -= relr_offsets[i];
@@ -1082,11 +1106,6 @@ void OutputSection<E>::write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const {
     i64 begin = idx * DYNREL_SHARD_SIZE;
     i64 end = std::min<i64>(begin + DYNREL_SHARD_SIZE, abs_rels.size());
     ElfRel<E> *loc = buf + offsets[idx];
-
-    auto write = [&](ElfRel<E> rel) {
-      if (!ctx.arg.pack_dyn_relocs_relr || !is_relr(rel))
-        *loc++ = rel;
-    };
 
     for (const AbsRel<E> &r : std::span(abs_rels).subspan(begin, end - begin)) {
       Symbol<E> &sym = *r.sym;
@@ -1101,17 +1120,18 @@ void OutputSection<E>::write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const {
 
       switch (r.kind) {
       case ABS_REL_NONE:
+      case ABS_REL_RELR:
         break;
       case ABS_REL_BASEREL:
-        write(ElfRel<E>(P, E::R_RELATIVE, 0, S + A));
+        *loc++ = ElfRel<E>(P, E::R_RELATIVE, 0, S + A);
         break;
       case ABS_REL_IFUNC:
         if constexpr (supports_ifunc<E>)
-          write(ElfRel<E>(P, E::R_IRELATIVE, 0,
-                          sym.get_addr(ctx, NO_PLT) + A));
+          *loc++ = ElfRel<E>(P, E::R_IRELATIVE, 0,
+                             sym.get_addr(ctx, NO_PLT) + A);
         break;
       case ABS_REL_DYNREL:
-        write(ElfRel<E>(P, E::R_ABS, sym.get_dynsym_idx(ctx), A));
+        *loc++ = ElfRel<E>(P, E::R_ABS, sym.get_dynsym_idx(ctx), A);
         break;
       }
     }
@@ -1340,7 +1360,7 @@ void OutputSection<E>::scan_abs_relocations(Context<E> &ctx) {
     InputSection<E> *isec = members[i];
     for (const ElfRel<E> &r : isec->get_rels(ctx))
       if (is_absrel(r))
-        shards[i].push_back(AbsRel<E>{isec, r.r_offset, isec->file.symbols[r.r_sym],
+        shards[i].push_back(AbsRel<E>{isec, r.r_offset, isec->file->symbols[r.r_sym],
                                       get_addend(*isec, r)});
   });
 
@@ -1459,7 +1479,7 @@ void OutputSection<E>::populate_symtab(Context<E> &ctx) {
 
 template <typename E>
 void GotSection<E>::add_got_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_got_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
+  sym->aux->got_idx = this->shdr.sh_size / sizeof(Word<E>);
 
   // An IFUNC symbol uses two GOT slots in a position-dependent
   // executable.
@@ -1473,14 +1493,14 @@ void GotSection<E>::add_got_symbol(Context<E> &ctx, Symbol<E> *sym) {
 
 template <typename E>
 void GotSection<E>::add_gottp_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_gottp_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
+  sym->aux->gottp_idx = this->shdr.sh_size / sizeof(Word<E>);
   this->shdr.sh_size += sizeof(Word<E>);
   gottp_syms.push_back(sym);
 }
 
 template <typename E>
 void GotSection<E>::add_tlsgd_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  sym->set_tlsgd_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
+  sym->aux->tlsgd_idx = this->shdr.sh_size / sizeof(Word<E>);
   this->shdr.sh_size += sizeof(Word<E>) * 2;
   tlsgd_syms.push_back(sym);
 }
@@ -1496,7 +1516,7 @@ void GotSection<E>::add_tlsdesc_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(supports_tlsdesc<E>);
   assert(!ctx.arg.static_);
 
-  sym->set_tlsdesc_idx(ctx, this->shdr.sh_size / sizeof(Word<E>));
+  sym->aux->tlsdesc_idx = this->shdr.sh_size / sizeof(Word<E>);
   this->shdr.sh_size += sizeof(Word<E>) * 2;
   tlsdesc_syms.push_back(sym);
 }
@@ -1642,10 +1662,46 @@ static std::vector<GotEntry<E>> get_got_entries(Context<E> &ctx) {
   return entries;
 }
 
+// Count the dynamic relocations that get_got_entries will emit, without
+// materializing the entries; computing each entry's value involves a
+// symbol address lookup, which is too expensive for a function that runs
+// on every layout iteration. The cases below must mirror the r_type
+// choices in get_got_entries.
 template <typename E>
 i64 GotSection<E>::get_num_dynrels(Context<E> &ctx) const {
-  auto fn = [](const GotEntry<E> &ent) { return ent.r_type != R_NONE; };
-  return ranges::count_if(get_got_entries(ctx), fn);
+  i64 n = 0;
+
+  for (Symbol<E> *sym : got_syms) {
+    if constexpr (supports_ifunc<E>) {
+      if (sym->is_ifunc()) {
+        n++; // R_IRELATIVE
+        continue;
+      }
+    }
+    if (sym->is_imported)
+      n++; // R_GLOB_DAT
+    else if (ctx.arg.pic && sym->is_relative())
+      n++; // R_RELATIVE
+  }
+
+  for (Symbol<E> *sym : tlsgd_syms) {
+    if (sym->is_imported)
+      n += 2; // R_DTPMOD + R_DTPOFF
+    else if (ctx.arg.shared)
+      n++; // R_DTPMOD
+  }
+
+  if constexpr (supports_tlsdesc<E>)
+    n += tlsdesc_syms.size(); // R_TLSDESC each
+
+  for (Symbol<E> *sym : gottp_syms)
+    if (sym->is_imported || ctx.arg.shared)
+      n++; // R_TPOFF
+
+  if (tlsld_idx != -1 && ctx.arg.shared)
+    n++; // R_DTPMOD
+
+  return n;
 }
 
 template <typename E>
@@ -1661,11 +1717,8 @@ std::vector<u64> GotSection<E>::get_relr_offsets(Context<E> &ctx) {
       if (sym->is_ifunc())
         continue;
 
-    if (!sym->is_imported && sym->is_relative()) {
-      u64 P = this->shdr.sh_addr + sym->get_got_idx(ctx) * sizeof(Word<E>);
-      if (P % sizeof(Word<E>) == 0)
-        offsets.push_back(P);
-    }
+    if (!sym->is_imported && sym->is_relative())
+      offsets.push_back(sym->get_got_idx(ctx) * sizeof(Word<E>));
   }
   return offsets;
 }
@@ -1682,7 +1735,7 @@ void GotSection<E>::write_dynrels(Context<E> &ctx, ElfRel<E> *buf) const {
                   ent.r_type,
                   ent.sym ? ent.sym->get_dynsym_idx(ctx) : 0,
                   ent.val);
-    if (!ctx.arg.pack_dyn_relocs_relr || !is_relr(rel))
+    if (!ctx.arg.pack_dyn_relocs_relr || !this->num_relrs || !is_relr(rel))
       *buf++ = rel;
   }
 }
@@ -1829,7 +1882,7 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(!sym->has_plt(ctx));
-  sym->set_plt_idx(ctx, symbols.size());
+  sym->aux->plt_idx = symbols.size();
   symbols.push_back(sym);
   ctx.dynsym->add_symbol(ctx, sym);
 }
@@ -1909,7 +1962,7 @@ void PltGotSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(!sym->has_plt(ctx));
   assert(sym->has_got(ctx));
 
-  sym->set_pltgot_idx(ctx, symbols.size());
+  sym->aux->pltgot_idx = symbols.size();
   symbols.push_back(sym);
   this->shdr.sh_size = symbols.size() * E::pltgot_size;
 }
@@ -2061,10 +2114,10 @@ to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name, U32<E> *shn_xindex)
         return ctx.extra.opd->shndx;
 
     if (InputSection<E> *isec = sym.get_input_section()) {
-      if (isec->is_alive)
+      if (isec->is_alive())
         return isec->output_section->shndx;
-      if (isec->icf_removed())
-        return isec->leader->output_section->shndx;
+      if (isec->is_icf_removed())
+        return isec->icf_leader->output_section->shndx;
     }
 
     return SHN_UNDEF;
@@ -2149,7 +2202,7 @@ void DynsymSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
     symbols.resize(1);
 
   if (sym->get_dynsym_idx(ctx) == -1) {
-    sym->set_dynsym_idx(ctx, -2);
+    sym->aux->dynsym_idx = -2;
     symbols.push_back(sym);
   }
 }
@@ -2257,7 +2310,7 @@ void GnuHashSection<E>::copy_buf(Context<E> &ctx) {
   for (i64 i = 0; i < syms.size(); i++) {
     constexpr i64 word_bits = sizeof(Word<E>) * 8;
 
-    u32 h = syms[i]->get_djb_hash(ctx);
+    u32 h = syms[i]->aux->djb_hash;
     indices[i] = h % num_buckets;
 
     i64 idx = (h / word_bits) % num_bloom;
@@ -2277,7 +2330,7 @@ void GnuHashSection<E>::copy_buf(Context<E> &ctx) {
   for (i64 i = 0; i < syms.size(); i++) {
     // The last entry in a chain must be terminated with an entry with
     // least-significant bit 1.
-    u32 h = syms[i]->get_djb_hash(ctx);
+    u32 h = syms[i]->aux->djb_hash;
     if (i == syms.size() - 1 || indices[i] != indices[i + 1])
       table[i] = h | 1;
     else
@@ -2638,6 +2691,8 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       if (ctx.arg.relocatable)
         continue;
 
+      u64 func_addr;
+
       for (i64 j = 0; j < rels.size(); j++) {
         const ElfRel<E> &rel = rels[j];
         assert(rel.r_offset - fde.input_offset < contents.size());
@@ -2647,13 +2702,30 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
         u64 val = sym.get_addr(ctx) + get_addend(cie.input_section, rel);
         apply_eh_reloc(ctx, rel, loc, val);
 
-        if (j == 0 && eh_hdr) {
-          // Write to .eh_frame_hdr
-          HdrEntry &ent = eh_hdr[file->fde_idx + i];
-          u64 origin = ctx.eh_frame_hdr->shdr.sh_addr;
-          ent.init_addr = val - origin;
-          ent.fde_addr = this->shdr.sh_addr + offset - origin;
-        }
+        if (j == 0)
+          func_addr = val;
+      }
+
+      if (!eh_hdr)
+        continue;
+
+      // Write to .eh_frame_hdr
+      HdrEntry &ent = eh_hdr[file->fde_idx + i];
+      u8 *ptr = base + offset + 8 + cie.fde_ptr_size;
+      u64 range = (cie.fde_ptr_size == 4) ? *(U32<E> *)ptr : *(U64<E> *)ptr;
+
+      if (range == 0) {
+        // Compilers may emit a meaningless FDE covering a zero-length
+        // address range. Such an FDE must not be written to .eh_frame_hdr
+        // because another function may start at the same address, and a
+        // binary search on .eh_frame_hdr could then find the empty FDE
+        // instead of the real one. We write a tombstone value instead.
+        ent.init_addr = INT32_MAX;
+        ent.fde_addr = 0;
+      } else {
+        u64 origin = ctx.eh_frame_hdr->shdr.sh_addr;
+        ent.init_addr = func_addr - origin;
+        ent.fde_addr = this->shdr.sh_addr + offset - origin;
       }
     }
   });
@@ -2683,7 +2755,7 @@ void SFrameSection<E>::construct(Context<E> &ctx) requires supports_sframe<E> {
   // position-independent and are simply concatenated by copy_buf.
   for (ObjectFile<E> *file : ctx.objs)
     for (SFrameFde<E> &fde : file->sframe_fdes)
-      if (fde.isec->is_alive)
+      if (fde.isec->is_alive())
         fdes.push_back(&fde);
 
   // If no live function has unwind info, leave the section empty so that
@@ -2931,7 +3003,8 @@ void CopyrelSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   // aliases. If one of the symbols is copied by a copy relocation, other
   // symbols have to refer to the copied place as well.
   for (Symbol<E> *sym2 : file.get_symbols_at(sym)) {
-    sym2->add_aux(ctx);
+    if (!sym2->aux)
+      sym2->aux = ctx.arena.template make<SymbolAux<E>>();
     sym2->is_imported = true;
     sym2->is_exported = true;
     sym2->has_copyrel = true;
@@ -3366,7 +3439,7 @@ void RelocSection<E>::update_shdr(Context<E> &ctx) {
 template <typename E>
 static std::pair<i64, i64>
 get_symidx_addend(Context<E> &ctx, InputSection<E> &isec, const ElfRel<E> &rel) {
-  Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+  Symbol<E> &sym = *isec.file->symbols[rel.r_sym];
 
   if (!(isec.shdr().sh_flags & SHF_ALLOC)) {
     SectionFragment<E> *frag;

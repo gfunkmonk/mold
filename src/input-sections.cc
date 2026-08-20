@@ -33,7 +33,7 @@ bool cie_equals(const CieRecord<E> &a, const CieRecord<E> &b) {
 template <typename E>
 InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx,
                               std::string_view section_name)
-  : file(file), shndx(shndx) {
+  : file(&file), shndx(shndx) {
   if (shndx < file.elf_sections.size()) {
     std::string_view name = section_name;
     if (name.empty())
@@ -66,19 +66,19 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file, i64 shndx,
 
 template <typename E>
 void InputSection<E>::uncompress(Context<E> &ctx) {
-  if (!(shdr().sh_flags & SHF_COMPRESSED) || uncompressed)
+  if (!(shdr().sh_flags & SHF_COMPRESSED) || is_uncompressed())
     return;
 
   u8 *buf = new u8[sh_size];
   copy_contents_to(ctx, buf, sh_size);
   contents = buf;
   ctx.string_pool.emplace_back(buf);
-  uncompressed = true;
+  set_uncompressed();
 }
 
 template <typename E>
 void InputSection<E>::copy_contents_to(Context<E> &ctx, u8 *buf, i64 sz) {
-  if (!(shdr().sh_flags & SHF_COMPRESSED) || uncompressed) {
+  if (!(shdr().sh_flags & SHF_COMPRESSED) || is_uncompressed()) {
     memcpy(buf, contents, sz);
     return;
   }
@@ -291,13 +291,37 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
 template <typename E>
 std::string_view
 InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) const {
-  for (Symbol<E> *sym : file.symbols)
-    if (sym->file == &file)
+  for (Symbol<E> *sym : file->symbols)
+    if (sym->file == file)
       if (const ElfSym<E> &esym = sym->esym();
           esym.st_shndx == shndx && esym.st_type == STT_FUNC &&
           esym.st_value <= offset && offset < esym.st_value + esym.st_size)
         return ctx.arg.demangle ? demangle(*sym) : sym->name();
   return "";
+}
+
+// Find the prevailing group having the same signature as the discarded group
+// that contains esym. This is called only on an error path, so a linear scan is
+// sufficient.
+template <typename E>
+static ObjectFile<E> *
+find_comdat_owner(Context<E> &ctx, ObjectFile<E> &file, const ElfSym<E> &esym) {
+  if (esym.is_undef() || esym.is_abs() || esym.is_common())
+    return nullptr;
+
+  i64 shndx = file.get_shndx(esym);
+  for (ComdatGroupRef<E> &ref : file.comdat_groups) {
+    if (ref.is_owner ||
+        !ranges::any_of(ref.members(file), [&](u32 x) { return x == shndx; }))
+      continue;
+
+    Symbol<E> *sig = ref.signature(ctx);
+    for (ObjectFile<E> *file : ctx.objs)
+      for (ComdatGroupRef<E> &ref : file->comdat_groups)
+        if (ref.is_owner && ref.signature(ctx) == sig)
+          return file;
+  }
+  return nullptr;
 }
 
 // Test if the symbol a given relocation refers to has already been resolved.
@@ -306,29 +330,33 @@ template <typename E>
 bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) {
   // If a relocation refers to a linker-synthesized symbol for a
   // section fragment, it's always been resolved.
-  if (file.elf_syms.size() <= rel.r_sym)
+  if (file->elf_syms.size() <= rel.r_sym)
     return false;
 
-  Symbol<E> &sym = *file.symbols[rel.r_sym];
-  const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
+  Symbol<E> &sym = *file->symbols[rel.r_sym];
+  const ElfSym<E> &esym = file->elf_syms[rel.r_sym];
 
   // A global symbol in a discarded COMDAT group should resolve to the
   // corresponding symbol in the prevailing group. If it does not, the
   // object files violate the One Definition Rule.
   if (!sym.file && &sym != discarded_comdat_sym<E>) {
-    Error(ctx) << *this << ": " << sym << " refers to a discarded COMDAT section"
-               << " probably due to an ODR violation";
+    std::stringstream ss;
+    ss << *this << ": " << sym << " refers to a discarded COMDAT section"
+       << " probably due to an ODR violation";
+    if (ObjectFile<E> *owner = find_comdat_owner(ctx, *file, esym))
+      ss << '\n' << ">>> prevailing definition is in " << *owner;
+    Error(ctx) << ss.str();
     return true;
   }
 
   auto record = [&] {
     std::stringstream ss;
-    if (std::string_view source = file.get_source_name(); !source.empty())
+    if (std::string_view source = file->get_source_name(); !source.empty())
       ss << ">>> referenced by " << source << "\n";
     else
       ss << ">>> referenced by " << *this << "\n";
 
-    ss << ">>>               " << file;
+    ss << ">>>               " << *file;
     if (std::string_view func = get_func_name(ctx, rel.r_offset); !func.empty())
       ss << ":(" << func << ")";
     ss << '\n';
@@ -442,8 +470,20 @@ void MergeableSection<E>::split_contents(Context<E> &ctx) {
 template <typename E>
 void MergeableSection<E>::resolve_contents(Context<E> &ctx) {
   fragments.reserve(frag_offsets.size());
-  for (i64 i = 0; i < frag_offsets.size(); i++)
-    fragments.push_back(parent.insert(ctx, get_contents(i), hashes[i], p2align));
+
+  // The hash table is typically much larger than the cache, so each
+  // insertion stalls on a cache miss for its first probe. We know all
+  // hashes upfront, so prefetch the bucket a few insertions ahead.
+  constexpr i64 lookahead = 8;
+
+  for (i64 i = 0; i < frag_offsets.size(); i++) {
+    if (i + lookahead < frag_offsets.size())
+      parent.map.prefetch(hashes[i + lookahead]);
+
+    SectionFragment<E> *frag =
+      parent.insert(ctx, get_contents(i), hashes[i], p2align);
+    fragments.push_back(parent.map.get_idx(frag));
+  }
 
   // Reclaim memory as we'll never use this vector again
   hashes.clear();

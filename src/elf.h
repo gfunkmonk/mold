@@ -170,16 +170,13 @@ enum : u32 {
   VER_NDX_GLOBAL = 1,
   VER_NDX_LAST_RESERVED = 1,
   VER_NDX_UNSPECIFIED = 0xffff,
+  VERSYM_HIDDEN = 0x8000,
 };
 
 enum : u32 {
   VER_FLG_BASE = 1,
   VER_FLG_WEAK = 2,
   VER_FLG_INFO = 4,
-};
-
-enum : u32 {
-  VERSYM_HIDDEN = 0x8000,
 };
 
 enum : u32 {
@@ -1944,7 +1941,7 @@ struct ARM64LE {
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
   static constexpr u32 thunk_hdr_size = 0;
-  static constexpr u32 thunk_size = 32;
+  static constexpr u32 thunk_size = 24;
   static constexpr u8 trap[] = { 0x00, 0x7d, 0x20, 0xd4 }; // brk
 
   static constexpr u32 R_COPY = R_AARCH64_COPY;
@@ -2211,7 +2208,7 @@ struct SH4LE {
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_SH;
   static constexpr u32 plt_hdr_size = 16;
-  static constexpr u32 plt_size = 16;
+  static constexpr u32 plt_size = 20;
   static constexpr u32 pltgot_size = 12;
   static constexpr u8 trap[] = { 0xfd, 0xff }; // illegal
 
